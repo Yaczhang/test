@@ -1,0 +1,2023 @@
+# -*- coding: utf-8 -*-
+# ===============================================================
+# Airfoil TE noise — TNO / Amiet pipeline (with diagnostics & OF fallback)
+# 改进版（稳定运行 + 物理一致化）：
+# - 展向相关默认 hybrid（finite→random 平滑过渡），抹平锯齿
+# - 几何衰减默认 (4πR)^2
+# - Cf@TE 采用 TE 近区稳健分位 + 适度放大（默认 p60 × 1.2）
+# - BL 侧：优先单侧 SS/PS，SUM 仅在单侧缺失时回退
+# - TE 核与形状函数默认“物理中性”：amiet76 / 关闭低频搁架/中频鼓包
+# - 日志增强：自由流一致、BL 来源、Cf 统计、增益记账、1/3-oct 覆盖率、单位提示
+# - 新增：gain_auto 自动增益（基于参考 1/3 倍频程谱）
+# - 新增：wps_slope_calib（基于参考 1/3 倍频程谱的频率幂次标定）
+# ===============================================================
+
+import os, re, json, csv, math, glob, shutil
+import numpy as np
+from dataclasses import dataclass, asdict
+from typing import Optional, Callable, List, Tuple, Dict, Any, Literal
+from pathlib import Path
+
+from scipy.interpolate import LinearNDInterpolator
+from scipy.spatial import cKDTree
+import matplotlib.pyplot as plt
+
+# 可选：runner 使用的读取函数（保留原样）
+try:
+    from amiet_data import (
+        read_profile_from_field,
+        read_profile_from_field_legacy,
+    )
+except Exception:
+    read_profile_from_field = None
+    read_profile_from_field_legacy = None
+
+# OpenFOAM 求解与导出（保留）
+try:
+    from openfoam import build_and_run_with_gmsh, export_amiet_inputs, amiet_presets
+except Exception:
+    build_and_run_with_gmsh = None
+    export_amiet_inputs = None
+    amiet_presets = None
+
+# -----------------------------
+# 轻量日志（同时保存到文件）
+# -----------------------------
+class Monitor:
+    def __init__(self, name="diag", save_dir=None):
+        self.name = name
+        self.items = []
+        self.save_dir = save_dir
+    def _push(self, level, msg):
+        self.items.append((level, str(msg)))
+    def info(self, msg): self._push("INFO", msg)
+    def warn(self, msg): self._push("WARN", msg)
+    def fail(self, msg): self._push("FAIL", msg)
+    def header(self, title): self.info("="*8 + " " + title + " " + "="*8)
+    def dump(self, fname=None):
+        if self.save_dir:
+            os.makedirs(self.save_dir, exist_ok=True)
+            fn = fname or f"{self.name}.txt"
+            path = os.path.join(self.save_dir, fn)
+            with open(path, "w", encoding="utf-8") as f:
+                for lvl, msg in self.items:
+                    f.write(f"[{lvl}] {msg}\n")
+            return path
+        return None
+    def dump_extra(self, path):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                for lvl, msg in self.items:
+                    f.write(f"[lvl={lvl}] {msg}\n")
+        except Exception as e:
+            self.warn(f"写入额外日志失败：{e}")
+
+# =============================
+# 基本数据结构
+# =============================
+@dataclass
+class FlowCondition:
+    M: float
+    rho: float
+    mu: float
+    U_inf: float
+    a: Optional[float] = None
+    Uc_factor: float = 0.75
+    def __post_init__(self):
+        if self.a is None:
+            if self.M <= 0:
+                raise ValueError("M must be > 0 to infer sound speed a")
+            self.a = self.U_inf / self.M
+    @property
+    def nu(self) -> float:
+        return self.mu / max(self.rho, 1e-12)
+
+@dataclass
+class AirfoilGeometry:
+    chord: float
+    span: float
+
+@dataclass
+class Observer:
+    R: float
+    theta: float
+    phi: float
+
+@dataclass
+class BLParams:
+    Ue: float
+    Cf: float
+    theta: float
+    delta_star: float
+    delta: float
+    utau: Optional[float] = None
+    Uc: Optional[float] = None
+    APG_pi: Optional[float] = None
+    def __post_init__(self):
+        if self.utau is None:
+            self.utau = self.Ue * np.sqrt(max(self.Cf, 1e-12)/2.0)
+        if self.Uc is None:
+            self.Uc = 0.75 * self.Ue
+
+# =============================
+# WPS（Goody / Rozenberg）
+# =============================
+@dataclass
+class RozenbergTuning:
+    a1: float=0.50
+    b1: float=3.70
+    a2: float=0.65
+    chi_exp1: float=0.70
+    chi_exp2: float=6.50
+    lowfreq_gain_k: float=0.60
+    lowfreq_chi0: float=0.20
+    Uc_factor: float=0.70   # 建议使用 0.70，更贴近 Rozenberg 原始设定
+    
+
+def wps_goody2004(f: np.ndarray, flow: FlowCondition, bl: BLParams, mon: Optional[Monitor]=None) -> np.ndarray:
+    rho, ut = flow.rho, bl.utau
+    Uc = max(flow.Uc_factor*bl.Ue, 1e-12)
+    delta = max(bl.delta, 1e-12)
+    two_pi = 2.0*np.pi
+    A = (rho**2) * (ut**4) * (delta / Uc)
+    chi = two_pi * f * delta / Uc
+    a1, b1, a2 = 0.5, 3.7, 0.75
+    G = (chi**2) / (((chi**0.75 + a1)**b1) * (1.0 + (chi/max(a2,1e-12))**7.0))
+    Phi = A * G
+    if mon:
+        mon.header("Goody Φqq")
+        mon.info(f"Uc={Uc:.3f}, A={A:.3e}, chi∈[{np.min(chi):.3g},{np.max(chi):.3g}]")
+        mon.info("[units] Φqq assumed as Pa^2/Hz")
+    return Phi
+
+# ---------------- Rozenberg 2012（单位固定为 Pa²/Hz） ----------------
+def _tget(tuning, key, default):
+    try:
+        if tuning is None: return default
+        if isinstance(tuning, dict): return tuning.get(key, default)
+        if hasattr(tuning, key):
+            val = getattr(tuning, key)
+            return default if val is None else val
+    except Exception:
+        pass
+    return default
+
+def wps_rozenberg2012(freqs_hz, flow, bl, mon=None, tuning=None):
+    f  = np.asarray(freqs_hz, float)
+    rho = float(getattr(flow, "rho", 1.225))
+    a0  = float(getattr(flow, "a",   340.0))
+    # Ue：优先 flow.Ue，再退 Uinf，再退 Ma*a
+    Ue_attr = getattr(flow, "Ue", None)
+    if Ue_attr is None:
+        Uinf_attr = getattr(flow, "Uinf", None)
+        if Uinf_attr is not None: Ue = float(Uinf_attr)
+        else:
+            M_attr = getattr(flow, "M", None)
+            if M_attr is None:
+                raise ValueError("Rozenberg 需要 Ue 或 Uinf 或 (M 与 a)")
+            Ue = float(M_attr) * a0
+    else:
+        Ue = float(Ue_attr)
+    # Uc
+    Uc_attr = getattr(flow, "Uc", None)
+    if Uc_attr is not None: Uc = float(Uc_attr)
+    else: Uc = float(_tget(tuning, "Uc_factor", 0.75)) * Ue
+    # δ99
+    delta99 = None
+    for holder in (bl, flow):
+        if holder is None: continue
+        for name in ("delta99", "delta_99", "delta"):
+            if hasattr(holder, name) and getattr(holder, name) is not None:
+                delta99 = float(getattr(holder, name)); break
+        if delta99 is not None: break
+    if not (delta99 and delta99 > 0):
+        raise ValueError("Rozenberg 需要 delta99（m）。")
+    # utau
+    utau_attr = getattr(bl, "utau", None)
+    if utau_attr is not None: utau = float(utau_attr)
+    else:
+        Cf_TE = None
+        for holder in (bl, flow):
+            if holder is None: continue
+            for nm in ("Cf_TE", "CfTE", "Cf", "cf"):
+                if hasattr(holder, nm) and getattr(holder, nm) is not None:
+                    Cf_TE = float(getattr(holder, nm)); break
+            if Cf_TE is not None: break
+        if Cf_TE is None:
+            raise ValueError("Rozenberg 需要 utau 或 Cf_TE（用于 utau=√(Cf/2)·Ue）")
+        utau = np.sqrt(0.5*Cf_TE) * Ue
+    # 频率无量纲
+    chi = (2.0*np.pi*f*delta99) / max(Uc, 1e-9)
+    # 形状函数（与结论一致化）
+    a1  = float(_tget(tuning, "a1", 0.5))
+    b1  = float(_tget(tuning, "b1", 3.7))
+    a2  = float(_tget(tuning, "a2", 0.65))
+    e1  = float(_tget(tuning, "chi_exp1", 0.7))
+    e2  = float(_tget(tuning, "chi_exp2", 6.5))
+    low_k = float(_tget(tuning, "lowfreq_gain_k", 0.6))
+    chi0  = float(_tget(tuning, "lowfreq_chi0",   0.2))
+    lowcorr = 1.0 + (low_k - 1.0) * np.exp(- (chi/chi0)**2 )
+    G_low  = 1.0 / (1.0 + (chi/e1)**b1)
+    G_high = (chi**2) / (1.0 + (chi/a2)**e2)
+    G0     = lowcorr * (a1*G_low + (1.0 - a1)*G_high)
+    # 前因子
+    A = (rho**2) * (utau**4) * (delta99 / max(Uc, 1e-9))
+    Phi = A * G0
+    if mon:
+        mon.info("======== Rozenberg Φqq (fixed-units, tuning-compatible) ========")
+        mon.info(f"rho={rho:.3f}, a0={a0:.2f}, Ue={Ue:.3f}, Uc={Uc:.3f}, utau={utau:.5f}, delta99={delta99:.5f}")
+        mon.info(f"A = rho^2*utau^4*(δ/Uc) = {A:.3e}")
+        mon.info("[units] Φqq assumed as Pa^2/Hz (point PSD)")
+    return Phi
+
+# =============================
+# Amiet 紧致 TE 核（增强 + 混合跨度）
+# =============================
+def _mon_kv(mon, key, val):
+    if mon is None: return
+    try:
+        if hasattr(mon, "kv"): mon.kv(key, val)
+        elif hasattr(mon, "info"): mon.info(f"{key}={val}")
+        elif hasattr(mon, "log"): mon.log(f"{key}={val}")
+        elif hasattr(mon, "write"): mon.write(f"{key}={val}")
+    except Exception:
+        pass
+
+def _amiet_te_kernel_full(
+    freqs_hz: np.ndarray,
+    Phi_qq: np.ndarray,
+    Uc: float, Ue: float, c0: float, rho0: float,
+    L_span: float, R: float,
+    theta_deg: float, phi_deg: float,
+    delta99: float,
+    *,
+    te_model: str = "amiet76",
+    lowfreq_gain_k: float = 1.0,               # 物理中性
+    beta_z: float = 1.4,                       # 推荐值更新：1.4
+    beta_fb: float = 600.0,                    # 推荐：600
+    beta_nb: float = 1.0,                      # 推荐：1.0
+    hf_tilt_n: float = 1.0,                    # 轻 roll-off
+    hf_f0: float = 7000.0,
+    lf_shelf_k: float = 1.0,                   # 关闭低频搁架
+    lf_f0: float = 350.0,
+    lf_n: float = 2.0,
+    phi_units: str = "Pa2_per_Hz",
+    corr_len_scale: float = 0.0,
+    mon=None,
+    K_cal: float = 2.0,
+    mf_boost_k: float = 1.0,                   # 关闭中频鼓包
+    mf_f0: float = 1600.0,
+    mf_n: float = 1.5,
+    geom_norm: str = "4piR2",                  # 默认 (4πR)^2
+    span_model: str = "hybrid",                # 默认混合
+    span_hybrid_kyL_thresh: float = math.pi,
+    span_hybrid_blend_width: float = 0.6,
+) -> np.ndarray:
+    eps = 1e-15
+    f   = np.asarray(freqs_hz, float); omega = 2.0*np.pi*f
+    k0  = omega/(c0+eps); k1 = omega/(Uc+eps)
+    theta = np.deg2rad(theta_deg); phi = np.deg2rad(phi_deg)
+    M = Ue/(c0+eps)
+    D = (np.sin(theta)**2)/((1.0 - M*np.cos(theta))**2 + eps)
+
+    # 几何：默认 (4πR)^2
+    gn = str(geom_norm).lower()
+    if gn in ("4pir2","4pir^2","4pir2_norm","4pir2_normed","4pir2.0","4pir2 "):
+        geom = 1.0 / (4.0*np.pi*max(R,1e-9))**2
+    elif gn == "r2":
+        geom = 1.0 / (max(R,1e-9)**2)
+    else:
+        geom = 1.0 / (4.0*np.pi*max(R,1e-9))**2
+
+    # 展向项：finite / random / hybrid
+    ky = k0*np.sin(theta)*np.cos(phi)
+    model = str(span_model).lower()
+
+    def finite_span_term(ky_):
+        span_arg = (ky_ * L_span) / (2.0*np.pi + eps)  # sinc 的 π 归一
+        return (np.sinc(span_arg)**2) * (L_span**2)
+
+    def random_span_term(ky_):
+        denom = 1.0 + (np.maximum(f,1.0)/max(beta_fb,1.0))**max(beta_nb,1e-6)
+        Lambda_z_f = max(1e-6, beta_z*delta99) / denom
+        return (2.0*Lambda_z_f * L_span) / (1.0 + (ky_*Lambda_z_f)**2)
+
+    if model == "finite":
+        S_span = finite_span_term(ky)
+        corr_factor = 1.0
+    elif model == "random":
+        S_span = random_span_term(ky)
+        corr_factor = 1.0 if phi_units == "Pa2_per_Hz" else 2.0*max(1e-12, corr_len_scale*delta99)
+    else:  # hybrid
+        S_fin = finite_span_term(ky)
+        S_rnd = random_span_term(ky)
+        kyL = np.abs(ky)*L_span
+        x0 = float(span_hybrid_kyL_thresh)
+        w  = max(1e-6, float(span_hybrid_blend_width))
+        t  = 1.0/(1.0 + np.exp(-(kyL - x0)/w))   # 0→1
+        S_span = (1.0 - t)*S_fin + t*S_rnd
+        corr_factor = 1.0
+
+    # TE 转移
+    tmdl = str(te_model).lower()
+    if tmdl == "amiet76":
+        mu = (k1*delta99)*(1.0 - M*np.cos(theta))/(1.0 + np.cos(theta) + eps)
+        H2 = 1.0/(1.0 + mu**2)
+    elif tmdl == "roger2005":
+        a_eff = 0.8*delta99
+        ka    = k1*a_eff
+        H2    = (ka**2)/(1.0 + ka**2)
+    else:
+        H2 = np.ones_like(k1)
+
+    # 高频/低频形状
+    if hf_tilt_n > 0.0:
+        H2 = H2 / (1.0 + (np.maximum(f,1.0)/max(hf_f0,1.0))**hf_tilt_n)
+    LF_shape = 1.0 if lf_shelf_k <= 0 else 1.0 + (lf_shelf_k - 1.0)/(1.0 + (f/lf_f0)**lf_n)
+    LF = float(lowfreq_gain_k)
+
+    # 组合
+    Spp = D * geom * S_span * H2 * LF * corr_factor * Phi_qq
+    Spp *= LF_shape
+
+    # 中频鼓包（默认关闭）
+    if mf_boost_k != 1.0:
+        logf  = np.log10(np.maximum(f, 1e-9))
+        logc  = np.log10(max(mf_f0, 1.0))
+        sigma = np.log10(1.0 + max(mf_n, 1e-6))
+        M_mid = 1.0 + (mf_boost_k - 1.0) * np.exp(-((logf - logc)**2) / (2.0 * sigma**2))
+        Spp  *= M_mid
+        _mon_kv(mon, "mid-bump", {"mf_boost_k": mf_boost_k, "mf_f0": mf_f0, "mf_n": mf_n})
+
+    # 记账
+    if f.size:
+        i0 = np.searchsorted(f, 1000.0); i0 = min(max(i0,0), f.size-1)
+        gain_ledger = {
+            "f0_Hz": float(f[i0]),
+            "D_dir": float(D),
+            "geom": float(geom),
+            "S_span": float(S_span[i0] if np.ndim(S_span) else S_span),
+            "|H_TE|^2": float(H2[i0] if np.ndim(H2) else H2),
+            "LF_gain": float(LF),
+            "LF_shape": float(LF_shape[i0] if np.ndim(LF_shape) else LF_shape),
+            "Phi_qq": float(Phi_qq[i0]),
+            "corr_factor": float(1.0),
+            "geom_norm": geom_norm, "span_model": model,
+        }
+        _mon_kv(mon, "GAIN_LEDGER@1kHz", gain_ledger)
+    return Spp * K_cal
+
+# 与原项目签名兼容的包装器
+def amiet_compact_te_Spp(
+    f: np.ndarray,
+    Phi_pp: np.ndarray,
+    flow, geo, obs, mon=None,
+    *,
+    bl=None,
+    Uc_factor: float = 0.75,
+    te_model: str = "amiet76",
+    K_cal: float = 2.0,
+    lowfreq_gain_k: float = 1.0,
+    beta_z: float = 1.4,
+    L_span: float = 0.58,
+    phi_units: str = "Pa2_per_Hz",
+    corr_len_scale: float = 0.0,
+    beta_fb: float = 600.0,
+    beta_nb: float = 1.0,
+    hf_tilt_n: float = 1.0,
+    hf_f0: float = 7000.0,
+    lf_shelf_k: float = 1.0,
+    lf_f0: float = 350.0,
+    lf_n: float = 2.0,
+    delta99_scale: float = 1.0,
+    mf_boost_k: float = 1.0,
+    mf_f0: float = 1600.0,
+    mf_n: float = 1.5,
+    geom_norm: str = "4piR2",
+    span_model: str = "hybrid",
+    span_hybrid_kyL_thresh: float = math.pi,
+    span_hybrid_blend_width: float = 0.6,
+) -> np.ndarray:
+    f = np.asarray(f, float)
+    Phi_pp = np.asarray(Phi_pp, float)
+    if Phi_pp.shape != f.shape:
+        raise ValueError("Phi_pp must have same shape as f")
+    c0  = float(getattr(flow, "a", 340.0))
+    rho = float(getattr(flow, "rho", 1.225))
+
+    Ue = getattr(flow, "Ue", None)
+    if Ue is None:
+        if hasattr(flow, "Uinf") and (flow.Uinf is not None): Ue = float(flow.Uinf)
+        elif hasattr(flow, "M") and (flow.M is not None): Ue = float(flow.M) * c0
+        else: raise ValueError("flow 需提供 Ue 或 Uinf 或 (M 与 a)")
+    Uc = float(getattr(flow, "Uc", Uc_factor*Ue))
+    L  = max(float(getattr(geo, "span", 0.0)), 1e-9)
+    R  = float(getattr(obs, "R", 1.0))
+    theta_deg = np.degrees(float(getattr(obs, "theta", 0.5*np.pi)))
+    phi_deg   = np.degrees(float(getattr(obs, "phi", 0.0)))
+
+    # δ99（带兜底）并做轻微缩放
+    delta99 = _require_delta99(flow, bl, mon) * float(delta99_scale)
+
+    Spp = _amiet_te_kernel_full(
+        freqs_hz=f,
+        Phi_qq=Phi_pp,
+        Uc=Uc, Ue=Ue, c0=c0, rho0=rho,
+        L_span=L, R=R,
+        theta_deg=theta_deg, phi_deg=phi_deg,
+        delta99=delta99,
+        te_model=te_model,
+        lowfreq_gain_k=lowfreq_gain_k,
+        beta_z=beta_z,
+        beta_fb=beta_fb, beta_nb=beta_nb,
+        hf_tilt_n=hf_tilt_n, hf_f0=hf_f0,
+        lf_shelf_k=lf_shelf_k, lf_f0=lf_f0, lf_n=lf_n,
+        phi_units=phi_units,
+        corr_len_scale=corr_len_scale,
+        mon=mon, K_cal=K_cal,
+        mf_boost_k=mf_boost_k, mf_f0=mf_f0, mf_n=mf_n,
+        geom_norm=geom_norm,
+        span_model=span_model,
+        span_hybrid_kyL_thresh = span_hybrid_kyL_thresh,
+        span_hybrid_blend_width = span_hybrid_blend_width,
+    )
+    if mon and hasattr(mon, "header"):
+        mon.header("Amiet TE kernel (hybrid span + 4πR² + neutral shapes)")
+        mon.info("[units] Spp output is Pa^2/Hz; SPL uses 20µPa reference.")
+    _mon_kv(mon, "Ue", Ue); _mon_kv(mon, "Uc", Uc); _mon_kv(mon, "a(c0)", c0)
+    _mon_kv(mon, "theta_deg", theta_deg); _mon_kv(mon, "phi_deg", phi_deg)
+    _mon_kv(mon, "delta99", delta99); _mon_kv(mon, "L_span", L); _mon_kv(mon, "R", R)
+    _mon_kv(mon, "te_model", te_model)
+    _mon_kv(mon, "span_model", span_model)
+    return Spp
+
+# ---------------- δ99 获取/兜底 ----------------
+_NUM = r'[+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+\-]?\d+)?'
+_LINE  = re.compile(r'^\s*' + _NUM + r'(?:\s+' + _NUM + r')+\s*$')
+
+def _require_delta99(flow, bl=None, mon=None) -> float:
+    # 1) 显式字段
+    for holder in (bl, flow):
+        if holder is None: continue
+        for name in ("delta99", "delta_99", "delta99m", "delta_99m", "delta"):
+            if hasattr(holder, name) and getattr(holder, name) is not None:
+                try:
+                    val = float(getattr(holder, name))
+                    if val > 0:
+                        _mon_kv(mon, "δ99(source)", name)
+                        return val
+                except Exception:
+                    pass
+    # 2) θ 兜底（δ99≈9·θ），可用 H=δ*/θ 微调
+    theta = None
+    for holder in (bl, flow):
+        if holder is None: continue
+        for nm in ("theta", "theta_m", "momentumThickness"):
+            if hasattr(holder, nm) and getattr(holder, nm) is not None:
+                try:
+                    theta = float(getattr(holder, nm)); break
+                except Exception:
+                    theta = None
+        if theta is not None: break
+    if theta is not None and theta > 0:
+        delta99_est = 9.0 * theta
+        H = None
+        for holder in (bl, flow):
+            if holder is None: continue
+            for nm in ("delta_star", "deltaStar", "displacementThickness"):
+                if hasattr(holder, nm) and getattr(holder, nm) is not None:
+                    try:
+                        delta_star = float(getattr(holder, nm))
+                        if delta_star > 0: H = delta_star / theta
+                    except Exception: pass
+        if H is not None and H > 0:
+            delta99_est *= (H / 1.35)
+        _mon_kv(mon, "δ99(estimated)", delta99_est)
+        return max(delta99_est, 1e-9)
+    raise ValueError("缺少 δ99：请提供 delta99 或 θ（将用 δ99≈9·θ 兜底）。")
+
+# =============================
+# ★★★ Step A 所需的三个极小工具函数 ★★★
+# =============================
+def _dump_input_snapshot(path_dir, *, flow, bl, geo, chosen_side, sources):
+    """把关键输入写到 JSON，便于复现（轻量、失败静默）。"""
+    try:
+        snap = dict(
+            side=str(chosen_side),
+            sources=sources,
+            flow=dict(M=getattr(flow,'M',None), a=getattr(flow,'a',None),
+                      U_inf=getattr(flow,'U_inf',None), rho=getattr(flow,'rho',None),
+                      mu=getattr(flow,'mu',None)),
+            bl=dict(Ue=bl.Ue, Cf=bl.Cf, theta=bl.theta, delta_star=bl.delta_star,
+                    delta99=getattr(bl,'delta',None), utau=bl.utau, Uc=bl.Uc),
+            geo=dict(chord=geo.chord, span=geo.span)
+        )
+        os.makedirs(path_dir, exist_ok=True)
+        with open(os.path.join(path_dir, "read_check.json"), "w", encoding="utf-8") as f:
+            json.dump(snap, f, indent=2)
+    except Exception:
+        pass
+
+def _harmonize_delta99(delta_file, delta_prof, *, lo=0.8, hi=1.25):
+    """返回 (delta_eff, source_tag, note)。仅在两者均有效时执行夹持，否则回退剖面值。"""
+    if (delta_prof is not None) and (delta_prof > 0):
+        if (delta_file is not None) and (delta_file > 0):
+            dmin, dmax = lo*delta_prof, hi*delta_prof
+            if delta_file < dmin:
+                return (dmin, "file_clipped_low", f"file={delta_file:g}<lo={dmin:g}")
+            if delta_file > dmax:
+                return (dmax, "file_clipped_high", f"file={delta_file:g}>hi={dmax:g}")
+            return (delta_file, "file_ok", "")
+        return (delta_prof, "profile_fallback", "file_missing_or_nonpos")
+    # 没有剖面估计时，不干预
+    return (delta_file, "unknown", "no_profile_ref")
+
+def _sanity_checks(mon, flow, bl, y, U):
+    """基础一致性提醒；不改变任何数据，仅写日志。"""
+    try:
+        if bl.theta and bl.delta_star and (bl.theta > 0):
+            H = bl.delta_star / bl.theta
+            if not (1.2 <= H <= 2.2):
+                mon.warn(f"[sanity] 形状因子 H=δ*/θ={H:.2f} 偏离 1.3~2.1，检查剖面/单位。")
+        if bl.delta and np.max(y) < 3.0*bl.delta:
+            mon.warn(f"[sanity] y_max={np.max(y):.4g} < 3δ，剖面可能过浅，高频会偏低。")
+        if bl.Cf and not (3e-4 <= bl.Cf <= 3e-3):
+            mon.warn(f"[sanity] Cf_TE={bl.Cf:.3e} 异常，确认 Cf_surface_xc 窗口/分位与平滑。")
+    except Exception:
+        pass
+
+# =============================
+# 1/3 倍频程
+# =============================
+def one_third_octave_centers(fmin=80.0, fmax=12000.0) -> np.ndarray:
+    k = np.arange(-60,60); f0=1000.0
+    centers = f0*(2.0**(k/3.0))
+    return centers[(centers>=fmin)&(centers<=fmax)]
+
+def integrate_to_bands(f: np.ndarray, Spp: np.ndarray, centers: np.ndarray, mon: Optional[Monitor]=None) -> np.ndarray:
+    out = np.zeros_like(centers, dtype=float)
+    f = np.asarray(f, float); Spp = np.asarray(Spp, float)
+    mgood = np.isfinite(f) & np.isfinite(Spp)
+    f = f[mgood]; Spp = Spp[mgood]
+    order = np.argsort(f); f = f[order]; Spp = Spp[order]
+    total_energy = np.trapz(Spp, f) if f.size>1 else 0.0
+    for i,fc in enumerate(centers):
+        fl = fc/(2.0**(1/6)); fu = fc*(2.0**(1/6))
+        m  = (f>=fl)&(f<=fu)
+        if np.count_nonzero(m)>=2:
+            out[i] = np.trapz(Spp[m], f[m])
+        elif np.count_nonzero(m)==1:
+            idx = int(np.where(m)[0][0]); out[i] = Spp[idx]*(fu-fl)
+        else:
+            out[i] = 0.0
+    if mon and total_energy>0:
+        mon.info(f"[1/3-oct] coverage≈{np.sum(out)/total_energy:.3f}")
+    return out
+
+# =============================
+# 用 (y, U) 拟合边界层参数
+# =============================
+def bl_params_from_profile(y: np.ndarray, U: np.ndarray, rho: float, mu: float,
+                           Ue: Optional[float]=None, mon: Optional[Monitor]=None) -> BLParams:
+    idx = np.argsort(y); y = np.asarray(y)[idx]; U = np.asarray(U)[idx]
+    Ue = float(np.mean(U[-min(5,len(U)):])) if (Ue is None) else float(Ue); ue = max(Ue, 1e-9)
+    dy = np.diff(y); Um = 0.5*(U[1:]+U[:-1])
+    delta_star = np.sum((1.0 - Um/ue)*dy)
+    theta = np.sum((Um/ue)*(1.0 - Um/ue)*dy)
+    ge = (U >= 0.99*ue)
+    delta_99 = y[int(np.argmax(ge))] if np.any(ge) else y[-1]
+    dUdy_wall = (U[1]-U[0]) / max(y[1]-y[0], 1e-12)
+    tau_w = mu * dUdy_wall; u_tau = np.sqrt(max(tau_w, 0.0)/rho)
+    Cf = 2.0*(u_tau/ue)**2; Uc = 0.75*ue
+    if mon:
+        mon.header("BL from (y,U)")
+        mon.info(f"Ue≈{ue:.3f}, θ={theta:.4e}, δ*={delta_star:.4e}, δ99={delta_99:.4e}, Cf≈{Cf:.4e}")
+    return BLParams(Ue=ue, Cf=Cf, theta=theta, delta_star=delta_star, delta=delta_99, utau=u_tau, Uc=Uc)
+
+# =============================
+# 读取 amiet_inputs（含单位修正与 Cf 稳健化 + ★Step A 夹持）
+# =============================
+def _prefer(v: Optional[float], fb: Optional[float]) -> Optional[float]:
+    return v if (v is not None and np.isfinite(v)) else fb
+
+def _read_keyval_csv(path: str) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"): continue
+            parsed = False
+            for sep in [",",";","\t"," "]:
+                if sep in line:
+                    kv = [t for t in line.split(sep) if t]
+                    if len(kv) >= 2:
+                        k = kv[0].strip().lower()
+                        try:
+                            v = float(kv[1]); out[k]=v; parsed=True; break
+                        except: pass
+            if (not parsed) and ("=" in line):
+                kv = line.split("=")
+                if len(kv)>=2:
+                    k = kv[0].strip().lower()
+                    try: out[k]=float(kv[1])
+                    except: pass
+    return out
+
+def _read_profile_csv(path: str) -> Dict[str, np.ndarray]:
+    with open(path, "r", encoding="utf-8") as fh:
+        reader = csv.reader(fh); rows = list(reader)
+    if not rows: raise ValueError(f"profile empty: {path}")
+    header = [h.strip().lower() for h in rows[0]]
+    data = []
+    for r in rows[1:]:
+        if len(r) != len(header): continue
+        try: data.append([float(x) for x in r])
+        except: continue
+    data = np.array(data, dtype=float)
+    out: Dict[str, np.ndarray] = {}
+    for want in ["y","u","p","rho","k","omega","nut","alphat"]:
+        if want in header:
+            out[want] = data[:, header.index(want)]
+    if "y" not in out or "u" not in out:
+        raise ValueError(f"{path}: need columns 'y' & 'U'")
+    return out
+
+def _norm_key(s: str) -> str:
+    return s.strip().lower().replace(" ", "_").replace("-", "_")
+
+def _try_float(x):
+    try:
+        return float(str(x).strip().replace(",", "."))
+    except Exception:
+        return None
+
+def _pick_row_by_side(rows, head_norm, side_want: str, mon=None):
+    side_col = None
+    for j, h in enumerate(head_norm):
+        if h in ("side", "surface", "face"):
+            side_col = j; break
+    if side_col is not None:
+        want = (side_want or "").strip().upper()
+        aliases = [want]
+        if want == "SS": aliases += ["SUCTION", "UPPER"]
+        if want == "PS": aliases += ["PRESSURE", "LOWER"]
+        aliases += ["SUM", "ALL", "BOTH", "COMBINED"]
+        for i in range(1, len(rows)):
+            side_val = str(rows[i][side_col]).strip().upper()
+            if side_val in aliases:
+                if mon: mon.info(f"BL参数：匹配到 side='{side_val}' 的第 {i} 行。")
+                return i, rows[i]
+    for i in range(1, len(rows)):
+        nums = sum(1 for v in rows[i] if _try_float(v) is not None)
+        if nums >= 2:
+            if mon: mon.warn(f"BL参数：未找到 side 行，改用第 {i} 行（含 {nums} 个数值列）。")
+            return i, rows[i]
+    return None, None
+
+# --------- 解析 line_normal_xcXXX_[SS/PS/SUM].csv 文件名（兼容 0p98 / 0p9795 等） ---------
+_profile_name_re = re.compile(r"^line_normal_xc([^_]+)_(SS|PS|SUM)\.csv$", re.IGNORECASE)
+
+def _parse_xc_from_profile_name(fname: str) -> Optional[Tuple[float,str]]:
+    m = _profile_name_re.match(fname)
+    if not m:
+        return None
+    tag = m.group(1)   # e.g. "0p98" 或 "0.9795"
+    side = m.group(2).upper()
+    try:
+        xc_val = float(tag.replace("p", "."))
+    except ValueError:
+        return None
+    return xc_val, side
+
+def _find_profile_file(amiet_dir: str, xc: float, prefer_side: str="SS",
+                       mon: Optional[Monitor]=None) -> Tuple[Optional[str], Optional[str], Optional[float]]:
+    """
+    在 amiet_dir 中搜索所有 line_normal_xc*_SS/PS/SUM.csv：
+    - 解析出 xc_file 和 side；
+    - 优先选 side=prefer_side 中与 xc 最近的一个；
+    - 若该侧没有，则按 SS→PS→SUM 顺序回退。
+    返回 (full_path, chosen_side, xc_file)。
+    """
+    prefer_side = prefer_side.upper().strip() or "SS"
+    files = [f for f in os.listdir(amiet_dir) if f.lower().startswith("line_normal_xc") and f.lower().endswith(".csv")]
+    candidates: List[Tuple[str,float,str]] = []
+    for fn in files:
+        parsed = _parse_xc_from_profile_name(fn)
+        if parsed is None:
+            continue
+        xc_file, side = parsed
+        candidates.append((fn, xc_file, side))
+    if not candidates:
+        return None, None, None
+
+    def _select_for_side(side: str) -> Optional[Tuple[str,float,str]]:
+        arr = [c for c in candidates if c[2] == side]
+        if not arr:
+            return None
+        arr.sort(key=lambda t: abs(t[1]-xc))
+        return arr[0]
+
+    chosen = _select_for_side(prefer_side)
+    if chosen is None:
+        for s in ("SS","PS","SUM"):
+            chosen = _select_for_side(s)
+            if chosen is not None:
+                break
+    if chosen is None:
+        return None, None, None
+
+    fn, xc_file, side = chosen
+    full_path = os.path.join(amiet_dir, fn)
+    if mon:
+        mon.info(f"[profile] 目标 xc={xc:.4f}，选择文件 {fn} (xc≈{xc_file:.4f}, side={side})")
+    return full_path, side, xc_file
+
+# TE Cf 曲线读取与稳健化 —— 分位 + 放大
+def _read_cf_surface(amiet_dir: str, mon: Optional[Monitor]=None) -> List[Tuple[float,float]]:
+    f_cf = os.path.join(amiet_dir, "Cf_surface_xc.csv")
+    if not os.path.isfile(f_cf): return []
+    xs, cfs = [], []
+    with open(f_cf, "r", encoding="utf-8") as fh:
+        rdr = csv.reader(fh)
+        rows = [r for r in rdr if r and any(t.strip() for t in r)]
+    if not rows: return []
+    head = [h.strip().lower() for h in rows[0]]
+    def try_add(row):
+        try:
+            if "cf" in head and "x" in head:
+                x = float(row[head.index("x")]); cf=float(row[head.index("cf")])
+                if np.isfinite(x) and np.isfinite(cf): xs.append(x); cfs.append(cf)
+            else:
+                vals = [float(v) for v in row]
+                if len(vals)>=2: xs.append(vals[0]); cfs.append(vals[-1])
+        except: pass
+    try:
+        [float(v) for v in rows[0]]; start_idx = 0
+    except:
+        start_idx = 1
+    for r in rows[start_idx:]:
+        try_add(r)
+    if mon: mon.info(f"读取 Cf_surface_xc.csv 成功：有效行数 {len(xs)}")
+    return list(zip(xs, cfs))
+
+def _pick_te_Cf_from_surface(pairs_x_cf: List[Tuple[float,float]], xc: float,
+                             mon: Optional[Monitor]=None, pctl: float=60.0, K: float=1.2) -> Optional[float]:
+    if not pairs_x_cf: return None
+    X = np.array([p[0] for p in pairs_x_cf], float)
+    C = np.array([p[1] for p in pairs_x_cf], float)
+    mask = np.abs(X - float(xc)) <= 0.03
+    n_win = int(np.count_nonzero(mask))
+    if mon: mon.info(f"[Cf@TE] window x∈[{xc-0.03:.2f},{xc+0.03:.2f}], n={n_win} / {len(X)}")
+    if n_win:
+        vals = C[mask]
+    else:
+        order = np.argsort(X)
+        keep = order[int(0.9*len(order)):]  # 取尾段逼近 TE
+        vals = C[keep]
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0: return None
+    cf_pick = float(np.percentile(vals, max(0.0, min(100.0, pctl))))
+    cf_raw = cf_pick
+    cf_pick *= float(K)  # 放大因子
+    if mon:
+        mon.info(f"[Cf@TE] p{pctl:.0f}={cf_raw:.6e}, K={K:.2f} → Cf_TE={cf_pick:.6e}")
+    if not (1e-5 <= cf_pick <= 5e-2):
+        if mon: mon.warn(f"Cf_TE 异常越界：{cf_pick:.3e}，将忽略。")
+        return None
+    return cf_pick
+
+def read_amiet_inputs_dir(amiet_dir: str, *, xc: float=0.98, side: str="SS",
+                          y_is_y_over_c: Optional[bool]=None,
+                          U_units: Optional[str]=None,
+                          mon: Optional[Monitor]=None, Kcfte=1.2, pctl_cfte: float=60.0):
+    if mon: mon.header(f"Read amiet_inputs @ {amiet_dir}")
+    fs_path = os.path.join(amiet_dir, "freestream.csv")
+    if not os.path.isfile(fs_path):
+        raise FileNotFoundError(f"missing: {fs_path}")
+    fs = _read_keyval_csv(fs_path)
+
+    Ma   = fs.get("ma", _prefer(fs.get("mach"), fs.get("m")))
+    a    = _prefer(fs.get("a"), fs.get("asound"))
+    Uinf = _prefer(fs.get("u_inf"), _prefer(fs.get("uinf"), fs.get("u")))
+    rho  = _prefer(fs.get("rho"), fs.get("rhoinf"))
+    mu   = _prefer(fs.get("mu"),  fs.get("muinf"))
+    alpha_deg = _prefer(fs.get("alpha"), fs.get("alpha_deg"))
+    Re_c = _prefer(fs.get("re"), fs.get("re_c"))
+    chord = _prefer(fs.get("c"), fs.get("chord"))
+    span  = _prefer(fs.get("span"), fs.get("b"))
+
+    if rho is None or mu is None:
+        raise ValueError("freestream.csv 必须包含 rho, mu")
+    if Ma is None and (a is None and Uinf is None):
+        raise ValueError("freestream.csv 需 Ma 与 a，或 U_inf 至少一组")
+    if Ma is None and (a is not None and Uinf is not None): Ma = float(Uinf)/float(a)
+    if a  is None and (Ma is not None and Uinf is not None): a  = float(Uinf)/float(Ma)
+    if Uinf is None and (Ma is not None and a is not None):  Uinf = float(Ma)*float(a)
+    Ma, a, Uinf = float(Ma), float(a), float(Uinf)
+    rho, mu = float(rho), float(mu)
+    chord = 1.0 if chord is None else float(chord)
+    span  = 1.0 if span  is None else float(span)
+    alpha_deg = float(_prefer(alpha_deg, 0.0))
+    Re_c = float(_prefer(Re_c, (rho*Uinf*chord)/max(mu,1e-12)))
+
+    # --------- 查找法向剖面：使用文件名解析，而不是死拼 0p98 ----------
+    side_tag = str(side).upper().strip() or "SS"
+    prof_path, chosen_side, xc_file = _find_profile_file(amiet_dir, xc=float(xc), prefer_side=side_tag, mon=mon)
+    if prof_path is None:
+        raise FileNotFoundError("缺少法向剖面：line_normal_xc*_SS/PS/SUM.csv")
+
+    if mon:
+        mon.info(f"使用法向剖面: {prof_path} （侧={chosen_side}）")
+        if chosen_side == "SUM":
+            mon.warn("BL 推算侧为 SUM（双侧合并），仅因单侧缺失而回退；建议提供 SS/PS 单侧剖面。")
+
+    prof = _read_profile_csv(prof_path)
+    y = prof["y"].astype(float)
+    U = prof["u"].astype(float)
+
+    # y 单位判断
+    y_scaled_from_yc = False
+    if y_is_y_over_c is True:
+        y = y * chord
+        y_scaled_from_yc = True
+    elif y_is_y_over_c is False:
+        pass
+    else:
+        if np.nanmax(np.abs(y)) < 0.2 and 0.2 <= chord <= 5.0:
+            y = y * chord
+            y_scaled_from_yc = True
+            if mon: mon.info(f"[units] 侦测到 y≈y/c，已按 c={chord:.3f} m 缩放到 SI。")
+    if mon:
+        mon.info(f"[units] y-scale: {'y/c→m' if y_scaled_from_yc else 'as-is (m)'}; c={chord:.3f} m")
+
+    # U 单位判断
+    Ue_guess = float(np.mean(U[-min(5, len(U)):])); used_u_over_uinf = False; used_mach = False
+    if U_units == 'mach': U = U * a; used_mach = True
+    elif U_units == 'u_over_uinf': U = U * Uinf; used_u_over_uinf = True
+    elif U_units == 'ms': pass
+    else:
+        if Ue_guess <= 2.5:
+            U = U * a
+            if mon: mon.warn(f"[units] U 无法明确判定（Mach 或 U/Uinf），按 Mach×a 缩放。")
+        else:
+            if mon: mon.info("[units] 侦测到 U 已是 m/s。")
+    if mon:
+        mon.info(f"[units] U-scale: {'Mach×a' if used_mach else ('(U/Uinf)×Uinf' if used_u_over_uinf else 'as-is (m/s)')}")
+
+    # ===== BL 参数（文件优先；单位修正；缺项由剖面补齐） =====
+    blp_file = os.path.join(amiet_dir, "bl_params_TE.csv")
+    delta_file_scaled = None
+    bl_est = None
+
+    if os.path.isfile(blp_file):
+        if mon: mon.info(f"使用 BL 参数文件: {blp_file}")
+        with open(blp_file, "r", encoding="utf-8") as fh:
+            rdr = csv.reader(fh)
+            rows = [row for row in rdr if row and any(str(c).strip() for c in row)]
+        d = {}
+        if rows and len(rows) >= 2:
+            head = [_norm_key(h) for h in rows[0]]
+            row_idx, row_vals = _pick_row_by_side(rows, head, chosen_side or side_tag, mon)
+            if row_idx is not None:
+                used_cols, skipped_cols = [], []
+                for j, hj in enumerate(head):
+                    v = _try_float(row_vals[j]) if j < len(row_vals) else None
+                    if v is not None:
+                        d[hj] = v; used_cols.append(hj)
+                    else:
+                        skipped_cols.append(hj)
+                if mon:
+                    mon.info(f"BL参数：成功解析列：{used_cols}")
+                    if skipped_cols: mon.warn(f"BL参数：非数值/跳过列：{skipped_cols}")
+            else:
+                if mon: mon.fail("BL参数：找不到可用的数据行。将回退到剖面估算。")
+        def _get_any(keys, default=None):
+            for k in keys:
+                k2 = _norm_key(k)
+                if k2 in d and d[k2] is not None:
+                    return d[k2]
+            return default
+        Ue_file = _prefer(_get_any(["Ue","U_e","edge_velocity"]), None)
+        delta   = _prefer(_get_any(["delta","delta99","bl_thickness"]), None)
+        # 支持 'delta*' 或 'delta_star'
+        delta_s = _prefer(_get_any(["delta_star","dstar","displacement_thickness","delta*"]), None)
+        theta   = _prefer(_get_any(["theta","momentum_thickness"]), None)
+        Cf_file = _prefer(_get_any(["Cf","c_f","skin_friction"]), None)
+
+        # 单位修正：若 δ/θ/δ* 像相对弦长（<0.2），乘以 c → m
+        def _maybe_scale_len(x, name):
+            if x is None: return None
+            if 0.2 <= chord <= 5.0 and 0.0 < x < 0.2:
+                if mon: mon.info(f"[units] {name}≈(·c) 检测成立：{x:g}，按 c={chord:.3f} m → {x*chord:.6f} m")
+                return x * chord
+            return x
+        delta   = _maybe_scale_len(delta,   "delta")
+        delta_s = _maybe_scale_len(delta_s, "delta*")
+        theta   = _maybe_scale_len(theta,   "theta")
+
+        # 用剖面估算（用于夹持与兜底）
+        bl_est = bl_params_from_profile(y, U, rho=rho, mu=mu, Ue=_prefer(Ue_file, None), mon=mon)
+
+        # 先按“文件优先 + 剖面补齐”构造 bl
+        Ue = _prefer(Ue_file, bl_est.Ue)
+        Cf = _prefer(Cf_file, bl_est.Cf)
+        theta = _prefer(theta, bl_est.theta)
+        delta_s = _prefer(delta_s, bl_est.delta_star)
+        delta = _prefer(delta, bl_est.delta)
+
+        # 保存“文件 δ”的单位修正后值（若确实来自文件）
+        if ("delta" in d or "delta99" in d or "bl_thickness" in d) and delta is not None:
+            delta_file_scaled = float(delta)
+
+        bl = BLParams(Ue=Ue, Cf=float(Cf), theta=float(theta), delta_star=float(delta_s),
+                      delta=float(delta), utau=None, Uc=None)
+    else:
+        if mon: mon.warn("缺少 bl_params_TE.csv，改用 (y,U) 估算。")
+        bl = bl_params_from_profile(y, U, rho=rho, mu=mu, mon=mon)
+        bl_est = bl  # 剖面即最终
+
+    # ===== Cf(TE) 覆盖：p60 × 1.2（更中性） =====
+    try:
+        pairs = _read_cf_surface(amiet_dir, mon)
+        cf_te = _pick_te_Cf_from_surface(pairs, xc=xc, mon=mon, pctl=pctl_cfte, K=Kcfte)
+        if cf_te is not None:
+            bl.Cf = float(cf_te)
+            bl.utau = bl.Ue * np.sqrt(max(bl.Cf, 1e-12)/2.0)
+            if mon: mon.info(f"[Cf@TE] 最终采用 Cf_TE={bl.Cf:.6e}, Ue={bl.Ue:.3f} m/s, utau={bl.utau:.4f} m/s")
+        else:
+            if mon: mon.info("Cf_surface_xc.csv 不可用或不合理，保持 BL 中的 Cf。")
+    except Exception as e:
+        if mon: mon.warn(f"Cf_surface_xc 解析失败：{e}; 使用 BL 中 Cf。")
+
+    # ===== ★ Step A：δ99 一致性“夹持” =====
+    try:
+        delta_prof = float(bl_est.delta) if (bl_est and getattr(bl_est, "delta", None)) else None
+        delta_file = float(delta_file_scaled) if (delta_file_scaled is not None) else None
+        delta_eff, dsrc, note = _harmonize_delta99(delta_file, delta_prof, lo=0.8, hi=1.25)
+        if (delta_eff is not None) and (delta_eff > 0):
+            if mon: mon.info(f"[δ99] profile={delta_prof}, file={delta_file} → use={delta_eff} <{dsrc}> {note}")
+            bl.delta = float(delta_eff)
+    except Exception as e:
+        if mon: mon.warn(f"[δ99] 夹持失败：{e}")
+
+    flow = FlowCondition(M=Ma, rho=rho, mu=mu, U_inf=Uinf, a=a)
+    geo  = AirfoilGeometry(chord=float(chord), span=float(span))
+
+    # ★ 快照 + 基础一致性提醒
+    try:
+        _dump_input_snapshot(amiet_dir, flow=flow, bl=bl, geo=geo,
+                             chosen_side=(chosen_side or side_tag),
+                             sources=dict(delta=("file" if delta_file_scaled is not None else "profile")))
+        _sanity_checks(mon, flow, bl, y, U)
+    except Exception:
+        pass
+
+    return flow, geo, bl, y, U
+
+# =============================
+# amiet_inputs 完整性检查与确保
+# =============================
+def _req_files_list(xc: float=0.98) -> Dict[str, str]:
+    # 这里只给人看的 pattern，逻辑检查不再依赖字符串拼接
+    return {
+        "freestream": "freestream.csv",
+        "profile_any": "line_normal_xc*_SS/PS/SUM.csv",
+        "bl_params": "bl_params_TE.csv",
+        "cf_curve":  "Cf_surface_xc.csv",
+    }
+
+def check_amiet_inputs_ready(amiet_dir: str, xc: float=0.98) -> Tuple[bool, List[str], Dict[str, str]]:
+    req = _req_files_list(xc)
+    missing: List[str] = []
+    present: Dict[str,str] = {}
+
+    # freestream（必须）
+    f_fs = os.path.join(amiet_dir, "freestream.csv")
+    has_fs = os.path.isfile(f_fs)
+    if has_fs:
+        present["freestream"] = f_fs
+    else:
+        missing.append(req["freestream"])
+
+    # profile_any（必须）：只要目录里有任意 line_normal_xc*_SS/PS/SUM.csv 即认为存在
+    prof_files = [f for f in os.listdir(amiet_dir)
+                  if f.lower().startswith("line_normal_xc") and f.lower().endswith(".csv")]
+    prof_any = None
+    for fn in prof_files:
+        if _parse_xc_from_profile_name(fn) is not None:
+            prof_any = os.path.join(amiet_dir, fn)
+            break
+    has_prof = prof_any is not None
+    if has_prof:
+        present["profile_any"] = prof_any
+    else:
+        missing.append(req["profile_any"])
+
+    # 其余文件视为“可选但推荐”
+    f_bl = os.path.join(amiet_dir, "bl_params_TE.csv")
+    if os.path.isfile(f_bl):
+        present["bl_params"] = f_bl
+    else:
+        missing.append(req["bl_params"])
+    f_cf = os.path.join(amiet_dir, "Cf_surface_xc.csv")
+    if os.path.isfile(f_cf):
+        present["cf_curve"] = f_cf
+    else:
+        missing.append(req["cf_curve"])
+
+    ok = has_fs and has_prof
+    return ok, missing, present
+
+def ensure_amiet_inputs(case_dir: str, *, xc: float, mon: Monitor) -> str:
+    amiet_dir = os.path.join(case_dir, "amiet_inputs")
+    ok, miss, present = check_amiet_inputs_ready(amiet_dir, xc=xc)
+    mon.header(f"Check amiet_inputs @ {amiet_dir}")
+    if ok:
+        mon.info(f"已就绪，发现：{present}")
+        return amiet_dir
+    mon.warn(f"不完整，缺：{miss}；尝试使用 of_probes_to_amiet 自动生成…")
+    try:
+        from of_probes_to_amiet import build_te_normal_profiles_all
+        try:
+            build_te_normal_profiles_all(case_dir)
+        except TypeError:
+            build_te_normal_profiles_all(str(case_dir))
+    except Exception as e:
+        mon.warn(f"调用 of_probes_to_amiet 失败：{e}")
+    ok2, miss2, present2 = check_amiet_inputs_ready(amiet_dir, xc=xc)
+    if ok2:
+        mon.info(f"of_probes_to_amiet 生成成功：{present2}")
+        return amiet_dir
+    mon.warn(f"仍缺：{miss2}；进入分项补齐（从 case 既有文件重建）")
+    try:
+        rebuilt = rebuild_line_normal_from_probes(case_dir, amiet_dir, xc=xc, mon=mon)
+        if rebuilt:
+            mon.info(f"line_normal_xc 重建完成：{rebuilt}")
+    except Exception as e:
+        mon.warn(f"由 probes 重建 line-normal 失败：{e}")
+    try:
+        out_cf = rebuild_cf_and_bl_from_surface(case_dir, amiet_dir, mon=mon)
+        if out_cf:
+            mon.info(f"表面量派生完成：{out_cf}")
+    except Exception as e:
+        mon.warn(f"由 surfaces/raw 补齐 Cf/BL 失败：{e}")
+    ok3, miss3, present3 = check_amiet_inputs_ready(amiet_dir, xc=xc)
+    if ok3:
+        mon.info(f"分项补齐成功：{present3}")
+        return amiet_dir
+    raise RuntimeError(f"amiet_inputs 仍不完整：缺 {miss3}。请检查 probes / surfaces 输出是否存在。")
+
+# =============================
+# probes → 剖面（保持）
+# =============================
+def _read_probes_meta(path: str) -> List[Tuple[float,float,float,str]]:
+    out = []
+    with open(path, "r", encoding="utf-8") as fh:
+        next(fh, None)
+        for raw in fh:
+            toks = [t.strip() for t in raw.strip().split(",")]
+            if len(toks) < 5: continue
+            _, xs, ys, zs, lab = toks[:5]
+            try:
+                out.append((float(xs), float(ys), float(zs), lab))
+            except: pass
+    return out
+
+def _read_openfoam_probes_table(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    times = []; rows = []
+    with open(path, "r", encoding="utf-8") as fh:
+        lines = [ln.rstrip("\n") for ln in fh]
+    if not lines: raise ValueError(f"empty probes file: {path}")
+    header = lines[0]
+    for ln in lines[1:]:
+        ln = ln.strip()
+        if not ln: continue
+        if not _LINE.match(ln): continue
+        vals = [float(v) for v in ln.split()]
+        times.append(vals[0]); rows.append(vals[1:])
+    if not rows: raise ValueError(f"no data rows in {path}")
+    return np.asarray(times, float), np.asarray(rows, float)
+
+def _last_snapshot(values: np.ndarray) -> np.ndarray:
+    return values[-1, :].copy()
+
+def _vector3_from_flat(flat: np.ndarray) -> np.ndarray:
+    if flat.size % 3 != 0:
+        raise ValueError("vector field columns not multiple of 3")
+    return flat.reshape((-1, 3))
+
+def rebuild_line_normal_from_probes(case_dir: str, amiet_dir: str, *, xc: float, mon: Monitor) -> List[str]:
+    pp_dir = os.path.join(case_dir, "postProcessing", "probesDict_TE", "0")
+    meta_csv = os.path.join(case_dir, "amiet_inputs", "probes_TE_meta.csv")
+    if not os.path.isfile(meta_csv):
+        cand = glob.glob(os.path.join(case_dir, "**", "probes_TE_meta.csv"), recursive=True)
+        if cand:
+            meta_csv = cand[0]
+    if not os.path.isdir(pp_dir) or not os.path.isfile(meta_csv):
+        mon.warn(f"缺 probes 源：{pp_dir} 或 {meta_csv}")
+        return []
+    mon.header("Rebuild line-normal from probes")
+    mon.info(f"读取 meta: {meta_csv}")
+    meta = _read_probes_meta(meta_csv)
+    if not meta: raise ValueError("probes_TE_meta.csv 为空或异常")
+
+    fld_files = {}
+    need = ["U","p","rho","k","omega","nut","alphat","T"]
+    for nm in need:
+        f = os.path.join(pp_dir, nm)
+        if os.path.isfile(f): fld_files[nm]=f; mon.info(f"发现 probes 字段：{nm} -> {f}")
+    if "U" not in fld_files:
+        raise FileNotFoundError("probes 缺 U 字段，无法重建法向剖面")
+
+    times, Utab = _read_openfoam_probes_table(fld_files["U"])
+    U_last = _vector3_from_flat(_last_snapshot(Utab))
+    npts = U_last.shape[0]
+    def grab_scalar(name):
+        if name not in fld_files: return None
+        t, arr = _read_openfoam_probes_table(fld_files[name])
+        return _last_snapshot(arr)
+    p_last   = grab_scalar("p")
+    rho_last = grab_scalar("rho")
+    k_last   = grab_scalar("k")
+    om_last  = grab_scalar("omega")
+    nut_last = grab_scalar("nut")
+    at_last  = grab_scalar("alphat")
+
+    ys_by_label: Dict[str, List[float]] = {}
+    U_by_label:  Dict[str, List[float]] = {}
+    scalars_by_label: Dict[str, Dict[str, List[float]]] = {}
+    used_idx = 0
+    for i,(x,y,z,lab) in enumerate(meta):
+        if i >= npts: break
+        ys_by_label.setdefault(lab, []).append(y)
+        U_by_label.setdefault(lab, []).append(np.linalg.norm(U_last[i,:]))
+        if p_last is not None:   scalars_by_label.setdefault(lab, {}).setdefault("p", []).append(p_last[i])
+        if rho_last is not None: scalars_by_label.setdefault(lab, {}).setdefault("rho", []).append(rho_last[i])
+        if k_last is not None:   scalars_by_label.setdefault(lab, {}).setdefault("k", []).append(k_last[i])
+        if om_last is not None:  scalars_by_label.setdefault(lab, {}).setdefault("omega", []).append(om_last[i])
+        if nut_last is not None: scalars_by_label.setdefault(lab, {}).setdefault("nut", []).append(nut_last[i])
+        if at_last is not None:  scalars_by_label.setdefault(lab, {}).setdefault("alphat", []).append(at_last[i])
+        used_idx += 1
+    mon.info(f"按 label 聚合完成，使用点数 {used_idx}/{npts}")
+
+    os.makedirs(amiet_dir, exist_ok=True)
+    created = []
+    def write_profile(tag, yv, Uv, scalars):
+        fn = os.path.join(amiet_dir, f"line_normal_xc{xc:.2f}_{tag}.csv".replace("0.","0p").replace("1.","1p"))
+        order = np.argsort(yv)
+        cols = ["y","U"]
+        table = [ [yv[j], Uv[j]] for j in order ]
+        for k in ["p","rho","k","omega","nut","alphat"]:
+            if (scalars is not None) and (k in scalars):
+                cols.append(k)
+                for rj, j in enumerate(order):
+                    table[rj].append(scalars[k][j])
+        with open(fn, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh); w.writerow(cols); w.writerows(table)
+        created.append(fn); mon.info(f"写出: {fn}")
+
+    SS = [k for k in ys_by_label if "SS" in k.upper()]
+    PS = [k for k in ys_by_label if "PS" in k.upper()]
+    if SS:
+        lab = SS[0]; write_profile("SS", ys_by_label[lab], U_by_label[lab], scalars_by_label.get(lab,{}))
+    if PS:
+        lab = PS[0]; write_profile("PS", ys_by_label[lab], U_by_label[lab], scalars_by_label.get(lab,{}))
+    if SS and PS:
+        y_sum = np.array(ys_by_label[SS[0]] + [-v for v in ys_by_label[PS[0]]], float)
+        U_sum = np.array(U_by_label[SS[0]] + U_by_label[PS[0]], float)
+        scal_sum: Dict[str,List[float]] = {}
+        for key in ["p","rho","k","omega","nut","alphat"]:
+            if key in scalars_by_label.get(SS[0],{}) or key in scalars_by_label.get(PS[0],{}):
+                scal_sum[key] = scalars_by_label.get(SS[0],{}).get(key, []) + scalars_by_label.get(PS[0],{}).get(key, [])
+        write_profile("SUM", np.abs(y_sum), U_sum, scal_sum)
+    return created
+
+# =============================
+# surfaces/raw → Cf/BL（保持）
+# =============================
+def _read_raw_xy_columns(path: str) -> Dict[str, np.ndarray]:
+    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+        lines = [ln.strip() for ln in fh if ln.strip()]
+    data = []
+    for ln in lines:
+        toks = ln.replace(",", " ").split()
+        try:
+            row = [float(v) for v in toks]; data.append(row)
+        except:
+            continue
+    arr = np.array(data, float)
+    out: Dict[str,np.ndarray] = {}
+    if arr.ndim==2 and arr.shape[1]>=4:
+        out["x"] = arr[:,0]; out["y"]=arr[:,1]; out["z"]=arr[:,2]
+        out["cols"] = arr[:,3:]
+    return out
+
+def rebuild_cf_and_bl_from_surface(case_dir: str, amiet_dir: str, mon: Monitor) -> List[str]:
+    created = []
+    surf_root = os.path.join(case_dir, "postProcessing", "surfaces_airfoil")
+    if not os.path.isdir(surf_root):
+        mon.warn(f"缺少 surfaces_airfoil 目录：{surf_root}")
+        return created
+    cand = [d for d in glob.glob(os.path.join(surf_root, "*")) if os.path.isdir(d)]
+    if not cand:
+        mon.warn("surfaces_airfoil 下没有时间目录"); return created
+    latest = sorted(cand, key=lambda p: float(os.path.basename(p).replace("_","") or "0"))[-1]
+    mon.info(f"surfaces latest dir = {latest}")
+
+    f_tau = os.path.join(latest, "wallShearStress_airfoil_all.raw")
+    f_U   = os.path.join(latest, "U_airfoil_all.raw")
+    f_rho = os.path.join(latest, "rho_airfoil_all.raw")
+
+    if os.path.isfile(f_tau) and os.path.isfile(f_U):
+        mon.info(f"读取 raw: {f_tau}")
+        d_tau = _read_raw_xy_columns(f_tau)
+        mon.info(f"读取 raw: {f_U}")
+        d_U   = _read_raw_xy_columns(f_U)
+        if "cols" in d_tau and d_tau["cols"].shape[1] >= 3:
+            tau_mag = np.linalg.norm(d_tau["cols"][:, :3], axis=1)
+        else:
+            tau_mag = d_tau.get("cols", np.zeros((0,1)))[:,0] if "cols" in d_tau else np.array([])
+        if "cols" in d_U and d_U["cols"].shape[1] >= 3:
+            U_mag = np.linalg.norm(d_U["cols"][:, :3], axis=1)
+        else:
+            U_mag = d_U.get("cols", np.zeros((0,1)))[:,0] if "cols" in d_U else np.array([])
+        if tau_mag.size and U_mag.size and d_U["x"].size==U_mag.size:
+            rho_use = None
+            f_fs = os.path.join(amiet_dir, "freestream.csv")
+            if os.path.isfile(f_rho):
+                d_rho = _read_raw_xy_columns(f_rho)
+                rho_local = d_rho["cols"][:,0] if "cols" in d_rho else np.full_like(U_mag, np.nan)
+                rho_use = np.nanmean(rho_local) if np.any(np.isfinite(rho_local)) else None
+            if rho_use is None and os.path.isfile(f_fs):
+                fs = _read_keyval_csv(f_fs)
+                rho_use = float(_prefer(fs.get("rho"), fs.get("rhoinf")))
+            if rho_use is None:
+                mon.warn("ρ 未找到，Cf 无法计算")
+            else:
+                x = d_U["x"]
+                order = np.argsort(x)
+                x_s = x[order]; Cf = tau_mag[order] / np.maximum(0.5*rho_use*(U_mag[order]**2), 1e-16)
+                out_cf = os.path.join(amiet_dir, "Cf_surface_xc.csv")
+                with open(out_cf, "w", newline="", encoding="utf-8") as fh:
+                    w = csv.writer(fh); w.writerow(["x","Cf"]); w.writerows(zip(x_s, Cf))
+                created.append(out_cf); mon.info(f"写出: {out_cf}")
+        else:
+            mon.warn("raw 列数或大小不匹配，跳过 Cf 估算")
+    else:
+        mon.warn("缺少 wallShearStress 或 U raw，跳过 Cf")
+
+    f_bl = os.path.join(amiet_dir, "bl_params_TE.csv")
+    if not os.path.isfile(f_bl):
+        prof = None
+        for p in glob.glob(os.path.join(amiet_dir, "line_normal_xc*_[S|P][S].csv")) + \
+                 glob.glob(os.path.join(amiet_dir, "line_normal_xc*_SUM.csv")):
+            prof = p; break
+        if prof:
+            profdat = _read_profile_csv(prof)
+            f_fs = os.path.join(amiet_dir, "freestream.csv")
+            if os.path.isfile(f_fs):
+                fs = _read_keyval_csv(f_fs)
+                rho = float(_prefer(fs.get("rho"), fs.get("rhoinf")))
+                mu  = float(_prefer(fs.get("mu"),  fs.get("muinf")))
+                bl = bl_params_from_profile(profdat["y"], profdat["u"], rho=rho, mu=mu)
+                with open(f_bl, "w", newline="", encoding="utf-8") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["Ue","Cf","theta","delta_star","delta","utau","Uc","APG_pi"])
+                    w.writerow([bl.Ue, bl.Cf, bl.theta, bl.delta_star, bl.delta, bl.utau or "", bl.Uc or "", bl.APG_pi or ""])
+                created.append(f_bl); mon.info(f"写出: {f_bl}")
+        else:
+            mon.warn("无可用的 line_normal_xc，跳过 BL 参数估算")
+    return created
+
+# =============================
+# Runner 规格（保持）
+# =============================
+class CFDCaseSpec:
+    def __init__(self, U_inf: float, alpha_deg: float, Re_c: float, a: float=340.0):
+        self.U_inf=U_inf; self.alpha=alpha_deg; self.Re_c=Re_c; self.a=a; self.M=U_inf/a
+    def to_runner_vec(self, nIter: int=2000, *, kind: Literal["mach","uinf"]="mach"):
+        if kind == "mach":
+            return [float(self.M), float(self.Re_c), float(self.alpha), int(nIter)]
+        else:
+            return [float(self.U_inf), float(self.Re_c), float(self.alpha), int(nIter)]
+
+def reconcile_uinf(Ma: float, a: float, Re_c: float, c: float, nu: float, mon: Optional[Monitor]=None) -> Tuple[float, List[str]]:
+    msgs = []
+    U_from_Ma = Ma*max(a,1e-9)
+    U_from_Re = (Re_c*max(nu,1e-12))/max(c,1e-12)
+    rel = abs(U_from_Ma - U_from_Re)/max(U_from_Ma,1e-9)
+    if rel > 0.1:
+        msgs.append(f"U_inf from Ma*a = {U_from_Ma:.3f}; from Re = {U_from_Re:.3f} (Δ≈{100*rel:.1f}%). Use Ma·a.")
+    else:
+        msgs.append(f"U_inf consistent: {U_from_Ma:.3f} vs {U_from_Re:.3f}.")
+    if mon:
+        mon.header("Freestream check")
+        for m in msgs: mon.info(m)
+    return U_from_Ma, msgs
+
+# =============================
+# 自动增益工具函数（基于参考谱）
+# =============================
+def _auto_gain_from_ref(
+    f_model: np.ndarray,
+    SPL_model: np.ndarray,
+    f_ref: Optional[np.ndarray],
+    SPL_ref: Optional[np.ndarray],
+    mon: Optional[Monitor]=None
+) -> float:
+    """在 log(f) 空间把 model 插值到参考频率上，计算平均 dB 差作为自动增益"""
+    if f_ref is None or SPL_ref is None:
+        if mon: mon.info("[gain_auto] 未提供参考谱，跳过自动增益。")
+        return 0.0
+    f_model = np.asarray(f_model, float)
+    SPL_model = np.asarray(SPL_model, float)
+    f_ref = np.asarray(f_ref, float)
+    SPL_ref = np.asarray(SPL_ref, float)
+    m = np.isfinite(f_ref) & np.isfinite(SPL_ref)
+    f_ref = f_ref[m]; SPL_ref = SPL_ref[m]
+    if f_ref.size < 2:
+        if mon: mon.warn("[gain_auto] 参考谱有效点少于 2，跳过自动增益。")
+        return 0.0
+    if np.any(f_model <= 0) or np.any(f_ref <= 0):
+        if mon: mon.warn("[gain_auto] 频率中含非正值，跳过自动增益。")
+        return 0.0
+    logf_mod = np.log10(f_model)
+    logf_ref = np.log10(f_ref)
+    SPL_mod_on_ref = np.interp(logf_ref, logf_mod, SPL_model, left=np.nan, right=np.nan)
+    m2 = np.isfinite(SPL_mod_on_ref)
+    if np.count_nonzero(m2) < 2:
+        if mon: mon.warn("[gain_auto] 插值后有效重叠点不足，跳过自动增益。")
+        return 0.0
+    diff = SPL_ref[m2] - SPL_mod_on_ref[m2]
+    gain_db = float(np.nanmean(diff))
+    if mon: mon.info(f"[gain_auto] 自动增益 = {gain_db:+.2f} dB（在 {np.count_nonzero(m2)} 个频点上拟合）")
+    return gain_db
+
+# ===== 基于参考 1/3 倍频程谱的“频率幂次”标定 =====
+def _wps_powerlaw_slope_from_ref(
+    centers_model: np.ndarray,
+    band_SPL_model: np.ndarray,
+    f_ref_points: np.ndarray,
+    SPL_ref_points: np.ndarray,
+    f_ref0: float = 1000.0,
+    mon: Optional[Monitor] = None,
+) -> Tuple[float, float]:
+    """
+    根据参考 1/3 倍频程谱，拟合一个简单的幂次修正：
+        ΔSPL(f) ≈ A + B·log10(f/f_ref0)
+    等价于在功率谱上乘：
+        Spp_new = K0 · (f/f_ref0)^p · Spp_old
+    返回 (K0, p)。若拟合失败则返回 (1.0, 0.0) 表示“不修正”。
+    """
+    centers_model = np.asarray(centers_model, float)
+    band_SPL_model = np.asarray(band_SPL_model, float)
+    f_ref_points = np.asarray(f_ref_points, float)
+    SPL_ref_points = np.asarray(SPL_ref_points, float)
+
+    m = np.isfinite(f_ref_points) & np.isfinite(SPL_ref_points) & (f_ref_points > 0.0)
+    f_ref = f_ref_points[m]
+    SPL_ref = SPL_ref_points[m]
+    if f_ref.size < 3:
+        if mon:
+            mon.warn("[wps_calib] 参考谱有效点少于 3，跳过谱斜率标定。")
+        return 1.0, 0.0
+
+    if np.any(centers_model <= 0.0):
+        if mon:
+            mon.warn("[wps_calib] 模型 1/3 倍频程中心频率含非正值，跳过谱斜率标定。")
+        return 1.0, 0.0
+
+    # 在 log(f) 空间把模型 1/3 倍频程谱插值到参考频率
+    logf_mod = np.log10(centers_model)
+    logf_ref = np.log10(f_ref)
+    SPL_mod_on_ref = np.interp(
+        logf_ref, logf_mod, band_SPL_model, left=np.nan, right=np.nan
+    )
+    m2 = np.isfinite(SPL_mod_on_ref)
+    if np.count_nonzero(m2) < 3:
+        if mon:
+            mon.warn("[wps_calib] 模型与参考谱重叠有效点少于 3，跳过谱斜率标定。")
+        return 1.0, 0.0
+
+    f_fit = f_ref[m2]
+    err = SPL_ref[m2] - SPL_mod_on_ref[m2]
+
+    # 拟合 err = A + B·log10(f/f_ref0)
+    logf_rel = np.log10(f_fit / max(f_ref0, 1.0))
+    X = np.vstack([np.ones_like(logf_rel), logf_rel]).T
+    try:
+        A, B = np.linalg.lstsq(X, err, rcond=None)[0]
+    except Exception as e:
+        if mon:
+            mon.warn(f"[wps_calib] 最小二乘拟合失败：{e}；跳过谱斜率标定。")
+        return 1.0, 0.0
+
+    K0 = 10.0 ** (A / 10.0)
+    p = B / 10.0
+    if mon:
+        mon.info(
+            f"[wps_calib] 拟合 ΔSPL≈{A:+.2f} + {B:+.2f}·log10(f/{f_ref0:.0f}) → "
+            f"K0={K0:.3e}, p={p:.3f}"
+        )
+    return float(K0), float(p)
+
+# =============================
+# 主流程
+# =============================
+def run_case_and_predict_SPL(case: 'CFDCaseSpec',
+                             chord: float, span: float,
+                             rho: float, mu: float,
+                             observer_R_theta_phi: Tuple[float,float,float],
+                             runner_obj=None,
+                             airfoil_dir:str=None, airfoil_file:str=None,
+                             nIter:int=2000,
+                             beta_z:float=1.40,
+                             L_span:float=0.58,
+                             K_cal :float=4.0,
+                             wps_fn: Callable[[np.ndarray, FlowCondition, BLParams], np.ndarray]=None,
+                             f: np.ndarray = None,
+                             model: str="amiet_rozenberg",
+                             tno_side: str="SS",
+                             level_correction_db: float=0.0,
+                             diagnostics_dir: Optional[str]=None,
+                             rozenberg_tuning: RozenbergTuning = RozenbergTuning(),
+                             backend: str="runner",
+                             openfoam_cfg: Optional[Dict[str,Any]] = None,
+                             # ===== TE 核（物理中性缺省） =====
+                             lowfreq_gain_k =1.0,
+                             te_model: str = "amiet76",
+                             beta_fb: float = 600.0,
+                             beta_nb: float = 1.0,
+                             hf_tilt_n: float = 1.0,
+                             hf_f0: float = 7000.0,
+                             lf_shelf_k: float = 1.0,
+                             lf_f0: float = 350.0,
+                             lf_n: float = 2.0,
+                             delta99_scale: float = 1.0,
+                             K_cfte: float = 1.2,
+                             mf_boost_k: float = 1.0,
+                             mf_f0: float = 1600.0,
+                             mf_n: float = 1.3,
+                             geom_norm: str = "4piR2",
+                             span_model: str = "hybrid",
+                             phi_units: str = "Pa2_per_Hz",
+                             corr_len_scale: float = 0.0,
+                             span_hybrid_kyL_thresh: float = math.pi,
+                             span_hybrid_blend_width: float = 0.6,
+                             # ===== 自动增益（可选） =====
+                             gain_auto: bool=False,
+                             gain_auto_ref_freq: Optional[np.ndarray]=None,
+                             gain_auto_ref_SPL: Optional[np.ndarray]=None,
+                             # ===== 壁压谱“频率幂次”标定（可选） =====
+                             wps_slope_calib: bool=False,
+                             wps_f_ref: float=1000.0,
+                             wps_calib_ref_freq: Optional[np.ndarray]=None,
+                             wps_calib_ref_SPL: Optional[np.ndarray]=None,
+                             ) -> Dict[str, Any]:
+
+    mon = Monitor(name="diag", save_dir=diagnostics_dir)
+    U_from_Ma, _ = reconcile_uinf(case.M, case.a, case.Re_c, chord, mu/max(rho,1e-12), mon)
+    case = CFDCaseSpec(U_inf=U_from_Ma, alpha_deg=case.alpha, Re_c=case.Re_c, a=case.a)
+
+    flow = FlowCondition(M=case.M, rho=rho, mu=mu, U_inf=case.U_inf, a=case.a, Uc_factor=rozenberg_tuning.Uc_factor)
+    geo  = AirfoilGeometry(chord=chord, span=span)
+    R, th, ph = observer_R_theta_phi
+    obs  = Observer(R=R, theta=th, phi=ph)
+
+    if backend.lower() == "runner":
+        if runner_obj is None or (airfoil_dir is None) or (airfoil_file is None):
+            raise RuntimeError("backend='runner' 需要 runner_obj, airfoil_dir, airfoil_file")
+        if read_profile_from_field is None:
+            raise RuntimeError("缺少 amiet_data.read_profile_from_field")
+        vec = case.to_runner_vec(nIter, kind="mach")
+        res = runner_obj.simu_fmt(airfoil_dir, airfoil_file, vec,
+                                  getattr(runner_obj,'simu_core',0),
+                                  getattr(runner_obj,'path_save', None))
+        save_dirs = getattr(res, 'save_dirs', None)
+        if save_dirs is None:
+            raise FileNotFoundError("CFD 运行未返回 save_dirs")
+        y, U = read_profile_from_field(
+            save_dirs=save_dirs, airfoil_name="NACA0012",
+            Ma=case.M, alpha_deg=case.alpha, Re_c=case.Re_c,
+            chord=chord, airfoil_dir=airfoil_dir, airfoil_file=airfoil_file,
+            flow_a=flow.a, flow_Uinf=case.U_inf,
+            x_over_c=0.98, y_max_over_c=0.06, n_sample=600,
+            dat_dir_key='field', vel_source="mach", vel_comp="mag", vel_norm="mach",
+            mon=mon
+        )
+        bl = bl_params_from_profile(y, U, rho=rho, mu=mu, mon=mon)
+
+    elif backend.lower() == "openfoam":
+        if build_and_run_with_gmsh is None or amiet_presets is None:
+            raise RuntimeError("openfoam 后端不可用（openfoam.py 未加载或导入失败）")
+        if openfoam_cfg is None:
+            raise RuntimeError("backend='openfoam' 需要 openfoam_cfg")
+        Ma = case.M
+        amiet_level = str(openfoam_cfg.get("amiet_level", "medium"))
+        case_tag = f"NACA0012_fromTemplate_Ma{Ma:.3f}_A{case.alpha:.1f}_N{int(max(nIter,1))}_{amiet_level}"
+        OUT_ROOT = openfoam_cfg["OUT_ROOT"]
+        case_dir = os.path.join(OUT_ROOT, case_tag)
+        
+        side = str(openfoam_cfg.get("side","SS")).upper()
+        mon.info(f"[openfoam] case_dir = {case_dir}")
+
+        amiet_dir = os.path.join(case_dir, "amiet_inputs")
+        os.makedirs(amiet_dir, exist_ok=True)
+        log_path = os.path.join(amiet_dir, "of_import.log")
+
+        TEMPLATE_GEO = openfoam_cfg["TEMPLATE_GEO"]
+        TEMPLATE_SYS = openfoam_cfg["TEMPLATE_SYS"]
+        GMSH_EXE     = openfoam_cfg.get("GMSH_EXE", r"D:\software\gmsh\gmsh.exe")
+        nproc = int(openfoam_cfg.get("nproc", 8))
+        aInf  = float(openfoam_cfg.get("aInf", 340.17))
+        rhoInf= float(openfoam_cfg.get("rhoInf", 1.225))
+        P = amiet_presets(amiet_level)
+        xc = float(openfoam_cfg.get("xc", P["te_x"]))
+        gamma=1.4; Rgas=287.058; Cp=1004.5; mu_of=1.8e-5; Pr=0.71; Prt=0.85
+
+        try:
+            # 尝试直接对已有 case_dir 做 export + ensure（不重算 CFD）
+            export_amiet_inputs(
+                Path(case_dir),
+                Ma=Ma, U_inf=Ma*aInf, rhoInf=rhoInf,
+                aInf=aInf, alpha_deg=case.alpha, mu=mu_of
+            )
+            amiet_dir = ensure_amiet_inputs(str(case_dir), xc=xc, mon=mon)
+        except Exception as e:
+            mon.warn(f"[openfoam] 直接从 {case_dir} 导出 amiet_inputs 失败，将尝试重新运行 CFD：{e}")
+            if (airfoil_dir is None) or (airfoil_file is None):
+                raise RuntimeError("openfoam 路线需要 airfoil_dir / airfoil_file") from e
+            mon.header("启动 OpenFOAM 求解以生成缺失数据")
+            case_path = build_and_run_with_gmsh(
+                case_root=Path(OUT_ROOT),
+                name_tag=case_tag,
+                airfoil_dat=Path(os.path.join(airfoil_dir, airfoil_file)),
+                template_system_root=Path(TEMPLATE_SYS),
+                Ma=Ma, Re=case.Re_c, alpha_deg=case.alpha, nSteps=int(nIter), nproc=nproc,
+                amiet_level=amiet_level,
+                template_geo=Path(TEMPLATE_GEO),
+                gmsh_exe_win=Path(GMSH_EXE),
+                gamma=gamma, Rgas=Rgas, Cp=Cp, mu=mu_of, Pr=Pr, Prt=Prt,
+                rhoInf=rhoInf, aInf=aInf,
+                patch_name_for_forces="airfoil"
+            )
+            export_amiet_inputs(
+                case_path,
+                Ma=Ma, U_inf=Ma*aInf, rhoInf=rhoInf,
+                aInf=aInf, alpha_deg=case.alpha, mu=mu_of
+            )
+            amiet_dir = ensure_amiet_inputs(str(case_path), xc=xc, mon=mon)
+
+        mon.dump_extra(log_path)
+
+        flow2, geo2, bl, y, U = read_amiet_inputs_dir(
+            amiet_dir, xc=xc, side=side, mon=mon, Kcfte=K_cfte, pctl_cfte=60.0
+        )
+        flow = flow2
+        geo = AirfoilGeometry(
+            chord=float(chord if chord is not None else geo2.chord),
+            span=float(span  if span  is not None else geo2.span)
+        )
+        mon.dump_extra(log_path)
+
+    elif backend.lower() == "of_files":
+        xc = 0.98
+        
+        if openfoam_cfg is None or ("amiet_dir" not in openfoam_cfg):
+            raise RuntimeError("backend='of_files' 需 openfoam_cfg={'amiet_dir': '...'}")
+        amiet_dir = openfoam_cfg["amiet_dir"]
+        # 为 of_files 单独提供一个默认 TE 位置，不能引用未定义的 xc
+        xc_local = float(openfoam_cfg.get("xc", xc))
+        side = openfoam_cfg.get("side", "SS")
+        flow2, geo2, bl, y, U = read_amiet_inputs_dir(
+            amiet_dir, xc=xc_local, side=side, mon=mon, Kcfte=K_cfte, pctl_cfte=60.0
+        )
+        flow = flow2
+        geo  = AirfoilGeometry(
+            chord=float(chord if chord is not None else geo2.chord),
+            span=float(span  if span  is not None else geo2.span)
+        )
+    else:
+        raise ValueError("backend 只能为 'runner'、'openfoam' 或 'of_files'")
+
+    # [FIX] 默认情况下，bl_eff 先等于 bl；Rozenberg 分支会再做 δ99 缩放
+    bl_eff = bl
+
+    nu = flow.mu/flow.rho
+    Re_from_inputs = flow.rho*case.U_inf*geo.chord/flow.mu
+    print(f"[CHK] Re(c): freestream={case.Re_c:.3e}, recomputed={Re_from_inputs:.3e}, "
+          f"Δ={abs(Re_from_inputs-case.Re_c)/case.Re_c*100:.1f}%")
+    cf_back = 2*(bl.utau/bl.Ue)**2
+    print(f"[CHK] Cf(back-calc)={cf_back:.6e}, Cf(TE_used)={bl.Cf:.6e}")
+    Re_tau = bl.utau*bl.delta/nu
+    print(f"[CHK] Re_tau ~ {Re_tau:.0f} (δ= {bl.delta:.4e} m, ν= {nu:.2e} m^2/s)")
+
+    # ★ 再做一次轻量 sanity 提醒（不改变结果）
+    _sanity_checks(mon, flow, bl, y, U)
+
+    if f is None:
+        f = np.logspace(np.log10(200.0), np.log10(10000.0), 400)
+
+    if model.lower() == "amiet_rozenberg":
+        Ue = getattr(flow, "Ue", flow.U_inf)
+        flow.Uc = rozenberg_tuning.Uc_factor * Ue
+
+        # ===== ★ 统一 Rozenberg 与 TE 核的有效 δ99 =====
+        try:
+            delta_raw = getattr(bl, "delta", None)
+            if (delta_raw is not None) and (delta_raw > 0.0):
+                scale = float(delta99_scale)
+                delta_eff = delta_raw * scale
+                if abs(scale - 1.0) > 1e-6:
+                    mon.info(f"[δ99_eff] raw={delta_raw:.4e} m, scale={scale:.3f} → δ99_eff={delta_eff:.4e} m")
+                bl_eff = BLParams(Ue=bl.Ue, Cf=bl.Cf, theta=bl.theta,
+                                  delta_star=bl.delta_star, delta=delta_eff,
+                                  utau=bl.utau, Uc=bl.Uc, APG_pi=bl.APG_pi)
+        except Exception as e:
+            mon.warn(f"[δ99_eff] 有效 δ99 构造失败，回退使用原始 δ99：{e}")
+            bl_eff = bl
+
+        # Rozenberg 使用 bl_eff
+        _wps = (lambda ff, fl, blp: wps_rozenberg2012(ff, fl, blp, mon, rozenberg_tuning)) \
+               if (wps_fn is None) else (lambda ff,fl,blp: wps_fn(ff, fl, blp))
+        Phi = _wps(f, flow, bl_eff)
+
+        # 让 flow.delta99 与 bl_eff 一致（供 _require_delta99 兜底）
+        try:
+            setattr(flow, "delta99", float(getattr(bl_eff, "delta", None)))
+        except Exception:
+            pass
+
+        # TE 核同样使用 bl_eff 的 δ99；此处 delta99_scale=1.0（避免二次缩放）
+        Spp = amiet_compact_te_Spp(
+            f, Phi, flow, geo, obs, mon,
+            bl=bl_eff,
+            Uc_factor=rozenberg_tuning.Uc_factor,
+            te_model=te_model,
+            lowfreq_gain_k=lowfreq_gain_k,
+            beta_z=beta_z,
+            L_span=L_span, K_cal=K_cal,
+            phi_units=phi_units,
+            corr_len_scale=corr_len_scale,
+            beta_fb=beta_fb, beta_nb=beta_nb,
+            hf_tilt_n=hf_tilt_n, hf_f0=hf_f0,
+            lf_shelf_k=lf_shelf_k, lf_f0=lf_f0, lf_n=lf_n,
+            delta99_scale=1.0,
+            mf_boost_k=mf_boost_k, mf_f0=mf_f0, mf_n=mf_n,
+            geom_norm=geom_norm,
+            span_model=span_model,
+            span_hybrid_kyL_thresh = span_hybrid_kyL_thresh,
+            span_hybrid_blend_width = span_hybrid_blend_width,
+        )
+    else:
+        Spp = _tno_nguyen2018_route(f, y, U, flow, geo, obs, bl, side=tno_side, mon=mon)
+
+    P_REF = 20e-6
+    Spp_safe = np.maximum(Spp, 1e-30)
+
+    # 先算一遍原始的线谱 + 1/3 倍频程谱
+    centers_full = one_third_octave_centers(80, 12000)
+    SPL_line = 10.0 * np.log10(Spp_safe / (P_REF**2)) + float(level_correction_db)
+    band_Spp = integrate_to_bands(f, Spp_safe, centers_full, mon)
+    band_SPL = 10.0 * np.log10(np.maximum(band_Spp, 1e-30) / (P_REF**2)) + level_correction_db
+
+    # ===== 可选：Rozenberg / WPS 频率幂次标定（校正斜率） =====
+    if wps_slope_calib and (wps_calib_ref_freq is not None) and (wps_calib_ref_SPL is not None):
+        K0_slope, p_slope = _wps_powerlaw_slope_from_ref(
+            centers_full,
+            band_SPL,
+            wps_calib_ref_freq,
+            wps_calib_ref_SPL,
+            f_ref0=wps_f_ref,
+            mon=mon,
+        )
+        if (abs(K0_slope - 1.0) > 1e-6) or (abs(p_slope) > 1e-6):
+            f_safe = np.maximum(np.asarray(f, float), 1.0)
+            slope_factor = K0_slope * (f_safe / max(wps_f_ref, 1.0)) ** p_slope
+            Spp_safe = Spp_safe * slope_factor
+            # 幂次修正作用在 Spp 上后，重新计算 SPL_line 与 1/3 倍频程谱
+            SPL_line = 10.0 * np.log10(np.maximum(Spp_safe, 1e-30) / (P_REF**2)) + float(level_correction_db)
+            band_Spp = integrate_to_bands(f_safe, Spp_safe, centers_full, mon)
+            band_SPL = 10.0 * np.log10(np.maximum(band_Spp, 1e-30) / (P_REF**2)) + level_correction_db
+            mon.info(
+                f"[wps_calib] 已对 Spp 施加频率幂函数修正："
+                f"K0={K0_slope:.3e}, p={p_slope:.3f} (ref={wps_f_ref:.1f} Hz)"
+            )
+        else:
+            mon.info("[wps_calib] 拟合得到 K0≈1, p≈0，不对谱做幂次修正。")
+    else:
+        if wps_slope_calib:
+            mon.info("[wps_calib] 参考谱缺失（freq 或 SPL 为 None），跳过谱斜率标定。")
+
+    # ===== 可选：基于参考 1/3 倍频程谱的自动增益（仅做常数平移） =====
+    auto_gain_db = 0.0
+    if gain_auto:
+        if gain_auto_ref_freq is not None and gain_auto_ref_SPL is not None:
+            auto_gain_db = _auto_gain_from_ref(
+                centers_full, band_SPL, gain_auto_ref_freq, gain_auto_ref_SPL, mon
+            )
+        else:
+            mon.info("[gain_auto] 未提供 gain_auto_ref_freq / gain_auto_ref_SPL，无法自动校准。")
+    if auto_gain_db != 0.0:
+        SPL_line = SPL_line + auto_gain_db
+        band_SPL = band_SPL + auto_gain_db
+        mon.info(f"[gain_auto] 已对 SPL_line 与 band_SPL 施加 {auto_gain_db:+.2f} dB 自动校正。")
+
+    # 最终线谱统计（包含幂次修正 + 自动增益）
+    mon.header("Final SPL (line)")
+    mon.info(
+        "SPL (min,max,mean) = "
+        f"{np.nanmin(SPL_line):.1f}, {np.nanmax(SPL_line):.1f}, {np.nanmean(SPL_line):.1f} dB ; "
+        f"correction={level_correction_db:+.1f} dB"
+    )
+
+    mon.dump("diag_case.txt")
+
+    return {
+        'case':case,
+        'flow':flow,
+        'bl': bl_eff if model.lower()=="amiet_rozenberg" else bl,
+        'SPL':SPL_line,
+        'Spp':Spp_safe,
+        'f':f,
+        'geo':geo,
+        'obs':obs,
+        'qc':[],
+        'band_centers':centers_full,
+        'band_SPL':band_SPL
+    }
+
+# =============================
+# 可选 Nguyen2018 路线（保持）
+# =============================
+def _tno_nguyen2018_route(f: np.ndarray, y: np.ndarray, U: np.ndarray,
+                          flow: FlowCondition, geo: AirfoilGeometry, obs: Observer,
+                          bl: BLParams, side: str="SS", mon: Optional[Monitor]=None) -> np.ndarray:
+    if mon: mon.header("Nguyen2018 route")
+    rho = flow.rho
+    Ue = bl.Ue; delta = max(bl.delta, 1e-12)
+    nu = flow.nu
+    dUdy = np.gradient(U, y, edge_order=2)
+    kappa = 0.41
+    yp = np.maximum(y*bl.utau/max(nu,1e-12), 0.0)
+    l_in = kappa*y*(1.0 - np.exp(-yp/26.0))
+    nut_in = (l_in**2)*np.abs(dUdy)
+    nut_out = 0.0168*Ue*max(bl.delta_star, 1e-12)/(1.0 + 5.5*(np.clip(y/delta,0,50)**6))
+    use_outer = nut_out > nut_in
+    nut = np.where(use_outer, nut_out, l_in**2*np.abs(dUdy))
+    l = np.where(use_outer, np.maximum(l_in, 1e-9), l_in)
+    L2 = np.maximum(l/np.maximum(kappa, 1e-12), 1e-12)
+    a_k = 2.0
+    k_tke = a_k * (np.maximum(nut/L2, 0.0)**2)
+    alpha_k = 0.4 if side.upper()=="SS" else 0.25
+    u2sq = alpha_k * k_tke
+    ke = 0.7/np.maximum(2.0*L2, 1e-12)
+    Uc = max(0.7*flow.U_inf, 1e-12)
+    two_pi = 2.0*np.pi
+    f = np.asarray(f, float); omega = two_pi*f
+    k1 = omega/Uc
+    kabs = np.abs(k1)
+    beta1, beta3 = 1.0, 0.75
+    def phi22(k1s, kes):
+        r1 = (beta1 * k1s / np.maximum(kes, 1e-16))**2
+        return (4.0/(9.0*np.pi))*(beta1*beta3)*(kes**2) * (r1) / np.maximum((1.0 + r1)**(7.0/3.0), 1e-30)
+    PhiP = np.zeros_like(f, dtype=float)
+    base = 4.0*(rho**2)
+    for i in range(f.size):
+        phi22_y = phi22(k1[i], ke)
+        integrand = L2 * np.abs(dUdy) * np.maximum(u2sq, 0.0) * phi22_y * np.exp(-2.0*kabs[i]*y)
+        PhiP[i] = base * np.trapz(integrand, y)
+    ke_cut = np.maximum(np.mean(ke), 1e-16)
+    H = 1.0 / (1.0 + (kabs/ke_cut)**2)
+    PhiP *= H
+    Spp = amiet_compact_te_Spp(f, PhiP, flow, geo, obs, mon)
+    Spp = np.minimum(Spp, (1e4)*(20e-6)**2)
+    return Spp
+
+# =============================
+# __main__ 测试（保持原结构，Case3 使用谱斜率标定）
+# =============================
+if __name__ == "__main__":
+    from amiet_fig7 import nguyen2018_fig7_data 
+    
+    cases, data = nguyen2018_fig7_data()
+    for label, alpha_deg, U_inf_ref, span, chord, R, theta, phi, Re_c in cases: ##[cases[0]]:
+        
+        print(label, alpha_deg, U_inf_ref, span, chord, R, theta, phi, Re_c)
+        
+        str_label = ''
+        per = data[label]
+        exp_f3 = data[label]['exp']['f']
+        exp_s3 = data[label]['exp']['spl']
+        xt_f3  = data[label]['xfoil']['f']
+        xt_s3  = data[label]['xfoil']['spl']
+        
+        # —— 几何 / 观察 ——（可以保持不变）
+        R, theta, phi, L_span = 1.0, np.deg2rad(90.0), 0.0, 0.58
+        K_cal         = 2.0
+        te_model      = "amiet76"
+        level_correction_db = 0.0
+        phi_units     = "Pa2_per_Hz"
+        corr_len_scale = 0.0
+        
+        # —— 跨展模型 —— 
+        span_model   = "hybrid"
+        beta_z       = 1.0
+        beta_fb      = 600.0
+        beta_nb      = 1.0
+        span_hybrid_kyL_thresh = math.pi * 0.6
+        span_hybrid_blend_width = 0.6
+        
+        # —— 高频 / 中频 —— 
+        hf_tilt_n    = 0.8
+        hf_f0        = 6000.0
+        
+        mf_boost_k   = 2.3
+        mf_f0        = 1700.0
+        mf_n         = 0.5
+        
+        # —— 低频搁架 —— 
+        lf_shelf_k   = 1.1
+        lf_f0        = 450.0
+        lf_n         = 2.4
+        
+        # —— Rozenberg —— 
+        lowfreq_gain_k = 0.35
+        a1, b1, a2       = 0.50, 3.70, 0.65
+        chi_exp1, chi_exp2 = 0.70, 6.50
+        lowfreq_chi0     = 0.20
+        Uc_factor        = 0.70
+        
+        # —— 其他保持 —— 
+        geom_norm           = "R2"
+        delta99_scale_main  = 1.0
+        K_cfte              = 4.0
+
+
+        # —— Rozenberg 调参 —— 
+        rozenberg_tuning = RozenbergTuning() 
+        rozenberg_tuning.a1 = a1 
+        rozenberg_tuning.b1 = b1 
+        rozenberg_tuning.a2 = a2 
+        rozenberg_tuning.chi_exp1 = chi_exp1 
+        rozenberg_tuning.chi_exp2 = chi_exp2 
+        rozenberg_tuning.lowfreq_gain_k = lowfreq_gain_k 
+        rozenberg_tuning.lowfreq_chi0 = lowfreq_chi0 
+        rozenberg_tuning.Uc_factor = Uc_factor
+        
+        rho = 1.225
+        mu  = 1.8e-5
+        a   = 340.0
+        f_line = np.logspace(np.log10(200.0), np.log10(10000.0), 400)
+        nIter = 2000
+        amiet_level = "ultra_strict"
+        
+
+        case = CFDCaseSpec(U_inf=U_inf_ref, alpha_deg=alpha_deg, Re_c=Re_c, a=a)
+        obs = (R, theta, phi)
+
+        OUT_ROOT = r"D:\work\continue_CFD_OpenFOAM\OpenFOAM_Amiet\SIMU_OUT\CFD_OPENFOAM"
+        os.makedirs(OUT_ROOT, exist_ok=True)
+
+        Ma = U_inf_ref / a
+        def make_case_tag(Ma: float, alpha_deg: float, nIter: int, level: str) -> str:
+            return f"NACA0012_fromTemplate_Ma{Ma:.3f}_A{alpha_deg:.1f}_N{int(nIter)}_{level}"
+
+        target_tag  = make_case_tag(Ma, alpha_deg, nIter, amiet_level)
+        target_dir  = os.path.join(OUT_ROOT, target_tag)
+
+        pattern = os.path.join(OUT_ROOT, "NACA0012_fromTemplate_Ma*_A*_N*_*")
+        candidates = []
+        rex = re.compile(r"NACA0012_fromTemplate_Ma([0-9.]+)_A([0-9.\-]+)_N(\d+)_([A-Za-z0-9_]+)$")
+        for p in glob.glob(pattern):
+            base = os.path.basename(p)
+            m = rex.match(base)
+            if not m: continue
+            Ma_c, A_c, N_c, L_c = float(m.group(1)), float(m.group(2)), int(m.group(3)), m.group(4)
+            if (abs(Ma_c - Ma) < 1.5e-3) and (abs(A_c - alpha_deg) < 1e-6) and (N_c == nIter) and (L_c == amiet_level):
+                candidates.append(p)
+
+        if candidates:
+            case_dir = sorted(candidates)[-1]
+        else:
+            case_dir = target_dir
+
+        openfoam_cfg: Dict[str, Any] = {
+            "case_dir":    case_dir,
+            "allow_rebuild": True,
+            "TEMPLATE_GEO": r"D:\work\continue_CFD_OpenFOAM\OpenFOAM_Amiet\OpenFOAM\airfoil_template.geo",
+            "TEMPLATE_SYS": r"D:\work\continue_CFD_OpenFOAM\OpenFOAM_Amiet\system_steady",
+            "OUT_ROOT":     OUT_ROOT,
+            "GMSH_EXE":     r"D:\software\gmsh\gmsh.exe",
+            "amiet_level":  amiet_level,
+            "nproc":        8,
+            "aInf":         a,
+            "rhoInf":       rho,
+        }
+
+        str_label  = str_label + '_' + span_model
+        save_dir = os.path.join(case_dir, "amiet_compare" + str_label)
+        os.makedirs(save_dir, exist_ok=True)
+
+        case = CFDCaseSpec(U_inf=U_inf_ref, alpha_deg=alpha_deg, Re_c=Re_c, a=a)
+
+        out = run_case_and_predict_SPL(
+            case,
+            chord=chord, span=span, rho=rho, mu=mu,
+            observer_R_theta_phi=(R, theta, phi),
+            runner_obj=None,
+            airfoil_dir=r"D:\work\continue_CFD_OpenFOAM\airfoil",
+            airfoil_file="NACA0012.dat",
+            nIter=nIter, beta_z=beta_z, L_span=L_span, f=f_line,
+            model="amiet_rozenberg",
+            tno_side="SS",K_cal=K_cal,
+            level_correction_db=level_correction_db,
+            diagnostics_dir=save_dir,
+            rozenberg_tuning=rozenberg_tuning,
+            backend="openfoam",
+            openfoam_cfg=openfoam_cfg, 
+            te_model=te_model,
+            lowfreq_gain_k=lowfreq_gain_k,
+            beta_fb=beta_fb, beta_nb=beta_nb,
+            hf_tilt_n=hf_tilt_n, hf_f0=hf_f0,
+            lf_shelf_k=lf_shelf_k, lf_f0=lf_f0, lf_n=lf_n,
+            delta99_scale=delta99_scale_main,
+            K_cfte=K_cfte,
+            mf_boost_k=mf_boost_k, mf_f0=mf_f0, mf_n=mf_n,
+            geom_norm=geom_norm,
+            span_model=span_model,
+            phi_units = phi_units,
+            corr_len_scale=corr_len_scale,
+            span_hybrid_kyL_thresh = span_hybrid_kyL_thresh,
+            span_hybrid_blend_width = span_hybrid_blend_width,
+            # —— 仅用谱斜率标定来校正 Rozenberg+Amiet 的频率斜率与整体水平 —— 
+            gain_auto=False,
+            gain_auto_ref_freq=exp_f3,
+            gain_auto_ref_SPL=exp_s3,
+            wps_slope_calib=True,
+            wps_f_ref=1000.0,
+            wps_calib_ref_freq=exp_f3,
+            wps_calib_ref_SPL=exp_s3,
+        )
+
+        f_calc   = out["f"]
+        SPL_line = out["SPL"]
+        centers  = out["band_centers"]
+        band_SPL = out["band_SPL"]
+
+        plt.figure(figsize=(8,5), dpi=140)
+        plt.semilogx(f_calc, SPL_line, label="This work (Amiet+Rozenberg, OF)")
+        plt.semilogx(exp_f3, exp_s3, 'o', label="Experiment (Nguyen 2018 Fig.7)")
+        plt.xlabel("Frequency [Hz]"); plt.ylabel("SPL [dB]")
+        plt.title(f"NACA0012 {label} — Line spectrum")
+        plt.grid(True, which='both', ls=':')
+        plt.legend()
+        plt.savefig(os.path.join(save_dir, "line_case3.png"), bbox_inches='tight')
+        plt.close()
+
+        def interp_logx(x, X, Y):
+            return np.interp(np.log10(x), np.log10(X), Y, left=np.nan, right=np.nan)
+
+        this_exp_match = interp_logx(xt_f3, centers, band_SPL)
+
+        plt.figure(figsize=(8,5), dpi=140)
+        plt.semilogx(xt_f3, xt_s3, '--', lw=2, label="XFOIL-TNO (Fig.7)")
+        plt.semilogx(exp_f3, exp_s3, 'o', label="Experiment (Fig.7)")
+        plt.semilogx(xt_f3, this_exp_match, '-', lw=2, label="This work (matched to EXP bands)")
+        plt.xlabel("Frequency [Hz] (log)"); plt.ylabel("SPL₁/₃ [dB]")
+        plt.title(f"NACA0012 {label} — 1/3-oct comparison")
+        plt.grid(True, which='both', ls=':')
+        plt.legend()
+        plt.savefig(os.path.join(save_dir, "compare_case3_1over3.png"), bbox_inches='tight')
+        plt.close()
+
+        with open(os.path.join(save_dir, "case3_line.csv"), "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh); w.writerow(["freq_Hz", "SPL_line_dB"])
+            for fi, vi in zip(f_calc, SPL_line):
+                w.writerow([float(fi), float(vi)])
+
+        with open(os.path.join(save_dir, "case3_1over3_compare.csv"), "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["freq_Hz", "EXP_dB", "XFOIL_TNO_dB", "ThisWork_dB_matched_to_EXP"])
+            xt_on_exp = np.interp(np.log10(exp_f3), np.log10(xt_f3), xt_s3, left=np.nan, right=np.nan)
+            THIS_on_exp = np.interp(exp_f3, xt_f3, this_exp_match, left=np.nan, right=np.nan)
+            
+            for fexp, expv, xtv, thisv in zip(exp_f3, exp_s3, xt_on_exp, THIS_on_exp):
+                w.writerow([float(fexp), float(expv), float(xtv), float(thisv)])
+
+        plt.figure(figsize=(8,5), dpi=140)
+        plt.semilogx(exp_f3, exp_s3, '--', lw=2, label="EXP_dB")
+        plt.semilogx(exp_f3, xt_on_exp, 'o', label="XFOIL_TNO_dB")
+        plt.semilogx(exp_f3, THIS_on_exp, '-', lw=2, label="This work (matched to EXP bands)")
+        plt.xlabel("Frequency [Hz] (log)"); plt.ylabel("SPL₁/₃ [dB]")
+        plt.title(f"NACA0012 {label} — 1/3-oct comparison")
+        plt.grid(True, which='both', ls=':')
+        plt.legend()
+        plt.savefig(os.path.join(save_dir, "compare_case3_1over3_CSV.png"), bbox_inches='tight')
+        plt.close()
+
+        of_log = os.path.join(case_dir, "amiet_inputs", "of_import.log")
+        diag   = os.path.join(save_dir, "diag_case.txt")
+        print(f"[DONE] 输出已保存到：{os.path.abspath(save_dir)}")
+        print(f"[NOTE] 详细日志：{of_log} 以及 {diag}")
