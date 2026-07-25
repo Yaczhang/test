@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="500" viewBox="0 0 1500 500">
+<defs><marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#333"/></marker></defs>
+<style>text{font-family:'Noto Sans CJK SC','Microsoft YaHei',sans-serif;fill:#222}.t{font-size:27px;font-weight:600}.s{font-size:22px}.box{fill:#e3eeea;stroke:#333;stroke-width:4}.box2{fill:#bfe0cd;stroke:#333;stroke-width:4}.box3{fill:#dde4c2;stroke:#333;stroke-width:4}.line{stroke:#333;stroke-width:4;fill:none}</style>
+<rect class="box" x="35" y="130" width="240" height="180" rx="12"/><rect class="box2" x="330" y="130" width="240" height="180" rx="12"/><rect class="box" x="625" y="130" width="240" height="180" rx="12"/><rect class="box2" x="920" y="130" width="240" height="180" rx="12"/><rect class="box3" x="1215" y="130" width="240" height="180" rx="12"/>
+<text class="t" x="155" y="185" text-anchor="middle">已知工况 q</text><text class="s" x="155" y="230" text-anchor="middle">待求参数 m</text>
+<text class="t" x="450" y="180" text-anchor="middle">数值正问题</text><text class="s" x="450" y="235" text-anchor="middle">Y = G(m,q)</text>
+<text class="t" x="745" y="180" text-anchor="middle">观测算子 H</text><text class="s" x="745" y="225" text-anchor="middle">采样、轮廓与图像</text>
+<text class="t" x="1040" y="180" text-anchor="middle">数据驱动反演</text><text class="s" x="1040" y="235" text-anchor="middle">Iθ</text>
+<text class="t" x="1335" y="185" text-anchor="middle">预测结果</text><text class="s" x="1335" y="235" text-anchor="middle">m̂</text>
+<line class="line" x1="275" y1="220" x2="330" y2="220" marker-end="url(#a)"/><line class="line" x1="570" y1="220" x2="625" y2="220" marker-end="url(#a)"/><line class="line" x1="865" y1="220" x2="920" y2="220" marker-end="url(#a)"/><line class="line" x1="1160" y1="220" x2="1215" y2="220" marker-end="url(#a)"/>
+<text class="s" x="450" y="105" text-anchor="middle">完整状态 Y</text><text class="s" x="745" y="105" text-anchor="middle">观测响应 Yobs</text><text class="s" x="1040" y="105" text-anchor="middle">训练得到网络参数 θ</text>
+<text class="s" x="750" y="390" text-anchor="middle">几何和流动条件属于已知输入，反演输出仅包含任务中待识别的力学参数</text>
+</svg>
