@@ -1,0 +1,17 @@
+\setlength{\unitlength}{1mm}%
+\begin{picture}(150,54)
+  \put(1,12){\framebox(29,25){\makebox(29,25)[c]{\shortstack{已知工况 $\boldsymbol q$\\待求参数 $\boldsymbol m$}}}}
+  \put(35,12){\framebox(29,25){\makebox(29,25)[c]{\shortstack{数值正问题\\$\mathcal{Y}=\mathcal{G}(\boldsymbol m,\boldsymbol q)$}}}}
+  \put(69,12){\framebox(29,25){\makebox(29,25)[c]{\shortstack{观测算子 $\mathcal H$\\采样、轮廓与图像}}}}
+  \put(103,12){\framebox(29,25){\makebox(29,25)[c]{\shortstack{数据驱动反演\\$\mathcal I_{\boldsymbol\theta}$}}}}
+  \put(136,12){\framebox(13,25){\makebox(13,25)[c]{\shortstack{预测\\$\widehat{\boldsymbol m}$}}}}
+
+  \put(30,24){\vector(1,0){5}}
+  \put(64,24){\vector(1,0){5}}
+  \put(98,24){\vector(1,0){5}}
+  \put(132,24){\vector(1,0){4}}
+  \put(39,40){\makebox(21,4)[c]{\scriptsize 完整状态 $\mathcal Y$}}
+  \put(72,40){\makebox(23,4)[c]{\scriptsize $\mathcal Y^{\mathrm{obs}}$}}
+  \put(104,40){\makebox(27,4)[c]{\scriptsize 训练得到 $\boldsymbol\theta$}}
+  \put(17,5){\makebox(116,4)[c]{\scriptsize 几何和流动条件属于已知输入，反演输出仅包含任务中待识别的力学参数}}
+\end{picture}
