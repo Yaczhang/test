@@ -1,0 +1,28 @@
+\setlength{\unitlength}{1mm}%
+\begin{picture}(150,58)
+  \put(1,2){\framebox(72,54){}}
+  \put(77,2){\framebox(72,54){}}
+  \put(5,51){\makebox(64,4)[c]{\small （a）流固界面附近的局部加密}}
+  \put(81,51){\makebox(64,4)[c]{\small （b）两类移动界面的处理}}
+
+  % left panel grid
+  \multiput(7,10)(8,0){8}{\line(0,1){33}}
+  \multiput(7,10)(0,7){6}{\line(1,0){56}}
+  \put(35,27){\oval(22,15)}
+  \multiput(24,20)(4,0){6}{\line(0,1){14}}
+  \multiput(24,20)(0,3.5){5}{\line(1,0){20}}
+  \put(35,27){\makebox(20,4)[c]{\scriptsize 细胞固体域}}
+  \put(12,44){\makebox(48,4)[c]{\scriptsize 远场较疏，流固边界附近加密}}
+
+  % right panel
+  \put(82,9){\line(1,0){62}}
+  \put(113,9){\line(0,1){35}}
+  \put(113,29){\oval(20,14)}
+  \put(113,29){\makebox(18,3)[c]{\scriptsize 细胞}}
+  \put(100,38){\oval(50,23)}
+  \put(83,44){\makebox(25,4)[c]{\scriptsize 相场外界面}}
+  \put(118,42){\makebox(24,4)[c]{\scriptsize ALE流固界面}}
+  \put(100,38){\vector(-1,0){8}}
+  \put(122,34){\vector(-1,-1){6}}
+  \put(81,14){\makebox(61,4)[c]{\scriptsize 气液界面由 $\varphi$ 捕捉，细胞边界由网格跟踪}}
+\end{picture}
