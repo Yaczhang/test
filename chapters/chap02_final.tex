@@ -6,9 +6,9 @@
 
 \section{研究对象与统一建模框架}
 
-微通道细胞受限变形过程中，胞内外介质均视为不可压缩牛顿流体。细胞边界在数值离散中按具有有限厚度的超弹性固体层处理，其内外表面分别与胞内流体和胞外流体构成流固界面。入口与出口之间的压力差驱动细胞进入收缩段，细胞依次经历横向压缩、轴向伸长和离开约束后的形态恢复。该模型不包含外部气液自由界面，主要输出为细胞轮廓、质心位置、运动速度和由数值模型定义的等效弹性模量。
+微通道细胞受限变形过程中，胞内外介质均视为不可压缩牛顿流体。细胞边界在数值离散中按具有有限厚度的超弹性固体层处理，其内外表面分别与胞内流体和胞外流体构成流固界面。入口与出口之间的压力差驱动细胞进入收缩段，细胞依次经历横向压缩、轴向伸长和离开约束后的形态恢复。该模型不包含外部气液自由界面，数值求解输出细胞轮廓、质心位置和运动速度，预先给定的材料参数作为过程级标签。
 
-含细胞复合液滴由周围气相、外部液滴液相和内部细胞组成。液滴下降接触固壁后经历接触、铺展、最大铺展和回缩，内部细胞在非定常压力、黏性剪切及自身材料恢复作用下发生变形和迁移。该模型在流固耦合基础上进一步引入相场气液界面、表面张力和壁面润湿条件，主要输出包括液滴外轮廓、铺展因子、接触线位置、动态接触角，以及内部细胞的轮廓、质心运动、等效应力和弹性应变能。
+含细胞复合液滴由周围气相、外部液滴液相和内部细胞组成。液滴下降接触固壁后经历接触、铺展、最大铺展和回缩，内部细胞在非定常压力、黏性剪切及自身材料恢复作用下发生变形和迁移。该模型在流固耦合基础上进一步引入相场气液界面、表面张力和壁面润湿条件。数值求解输出液滴外轮廓、铺展因子、接触线位置和名义动态接触角，以及内部细胞的轮廓、质心运动、等效应力和弹性应变能。弹性模量和黏弹性特征时间属于预先设置的材料参数，不作为正问题求解器的输出量。
 
 图~\ref{fig:ch2_two_models}给出了两类研究对象及其共同建模主线。二者共享流体方程、细胞材料模型、流固耦合条件和有限元求解框架，差异主要体现在流体域组成、界面类型、驱动方式、细胞几何表示和观测量。
 
@@ -34,7 +34,7 @@
 气液界面 & 不包含 & 相场方法描述 \\
 壁面润湿 & 不涉及气液润湿 & 通过壁面自由能给定平衡接触角 \\
 流固耦合 & 细胞层与胞内外流体耦合 & 内部细胞与液滴液相耦合 \\
-主要观测 & 细胞轮廓、质心和速度 & 内外轮廓、铺展、接触角及细胞响应 \\
+主要观测 & 细胞轮廓、质心和速度 & 内外轮廓、铺展、名义动态接触角及细胞响应 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -169,7 +169,7 @@ M_{\mathrm{pf}}
 \end{equation}
 相场方法以连续变量表示气液界面，适用于界面大变形、铺展和回缩过程\cite{anderson1998diffuseinterface,jacqmin1999phasefield,badalassi2003phasefield,yue2004diffuseinterface}。
 
-\subsection{表面张力与壁面润湿}
+\subsection{表面张力与润湿边界}
 
 采用式~\eqref{eq:ch2_phase_free_energy}所示自由能时，混合能系数与气液表面张力系数满足
 \begin{equation}
@@ -189,7 +189,7 @@ M_{\mathrm{pf}}
 \end{equation}
 该体积力主要分布在相场变量快速变化的界面区域，并通过式~\eqref{eq:ch2_ale_ns}作用于流场。
 
-设固壁边界为 $\Gamma_{\mathrm w}$，$\boldsymbol{n}_{\Omega}$ 为流体计算域在固壁处的外法向量，平衡接触角 $\theta_{\mathrm e}$ 在液相内部测量。本文采用与式~\eqref{eq:ch2_phase_free_energy}一致的壁面自由能密度
+设润湿边界为 $\Gamma_{\mathrm b}$，$\boldsymbol{n}_{\Omega}$ 为流体计算域在该边界处的外法向量，平衡接触角 $\theta_{\mathrm e}$ 在液相内部测量。与式~\eqref{eq:ch2_phase_free_energy}一致的壁面自由能密度写为
 \begin{equation}
 f_{\mathrm w}(\varphi)
 =
@@ -213,24 +213,24 @@ f_{\mathrm w}(\varphi)
 \frac{\mathrm df_{\mathrm w}}{\mathrm d\varphi}
 =0,
 \qquad
-\boldsymbol{x}\in\Gamma_{\mathrm w},
+\boldsymbol{x}\in\Gamma_{\mathrm b},
 \label{eq:ch2_wetting_bc}
 \end{equation}
 辅助变量满足无通量条件
 \begin{equation}
 \boldsymbol{n}_{\Omega}\cdot\nabla\psi=0,
 \qquad
-\boldsymbol{x}\in\Gamma_{\mathrm w}.
+\boldsymbol{x}\in\Gamma_{\mathrm b}.
 \label{eq:ch2_chemical_no_flux}
 \end{equation}
-另取 $\boldsymbol{n}_{\mathrm w}=-\boldsymbol{n}_{\Omega}$，使其由固壁指向流体区域。气液界面单位法向量 $\boldsymbol{n}_{\mathrm{lg}}$ 由气相指向液相，则平衡状态下有
+对于固体壁面，$\Gamma_{\mathrm b}=\Gamma_{\mathrm w}$，平衡接触角取相应工况设定值。含细胞复合液滴模型还在内部细胞外表面采用固定相场润湿参数，该参数在全部工况中保持不变，不作为参数分析对象。令 $\boldsymbol{n}_{\mathrm w}=-\boldsymbol{n}_{\Omega}$ 表示由固壁指向流体区域的单位法向量，气液界面单位法向量 $\boldsymbol{n}_{\mathrm{lg}}$ 由气相指向液相，则平衡状态下有
 \begin{equation}
 \cos\theta_{\mathrm e}
 =
 -\boldsymbol{n}_{\mathrm{lg}}\cdot\boldsymbol{n}_{\mathrm w}.
 \label{eq:ch2_contact_angle_geometry}
 \end{equation}
-上述法向取向同时用于动态接触角计算，避免平衡接触角和后处理接触角采用不同的角度约定\cite{deGennes1985wetting,bonn2009wetting,snoeijer2013moving}。
+上述法向取向同时用于后续接触角计算，避免平衡接触角与后处理角度采用不同约定\cite{deGennes1985wetting,bonn2009wetting,snoeijer2013moving}。
 
 \subsection{主要无量纲参数}
 
@@ -278,19 +278,19 @@ f_{\mathrm w}(\varphi)
 \begin{equation}
 \Lambda
 =
-\frac{D_{\mathrm s}}{D_0},
+\frac{d_{\mathrm s,0}}{D_0},
 \label{eq:ch2_size_ratio}
 \end{equation}
 对于初始球形液滴和球形细胞，内部细胞体积分数为
 \begin{equation}
 \alpha_{\mathrm s}
 =
-\left(\frac{D_{\mathrm s}}{D_0}\right)^3
+\left(\frac{d_{\mathrm s,0}}{D_0}\right)^3
 =
 \Lambda^3,
 \label{eq:ch2_volume_fraction}
 \end{equation}
-其中，$D_{\mathrm s}$ 为内部细胞初始直径。
+其中，$d_{\mathrm s,0}$ 为内部细胞初始直径。
 
 \section{细胞变形与材料模型}
 
@@ -318,27 +318,28 @@ J=\det\boldsymbol{F},
 \end{equation}
 右柯西格林张量和格林拉格朗日应变张量分别为
 \begin{equation}
-\boldsymbol{C}
+\boldsymbol{C}_{\mathrm{CG}}
 =
 \boldsymbol{F}^{\mathrm T}\boldsymbol{F},
 \qquad
 \boldsymbol{E}_{\mathrm{GL}}
 =
-\frac{1}{2}\left(\boldsymbol{C}-\boldsymbol{I}\right).
+\frac{1}{2}
+\left(\boldsymbol{C}_{\mathrm{CG}}-\boldsymbol{I}\right).
 \label{eq:ch2_strain_tensors}
 \end{equation}
-$\boldsymbol{C}$ 的三个不变量为
+$\boldsymbol{C}_{\mathrm{CG}}$ 的三个不变量为
 \begin{equation}
-I_1=\operatorname{tr}\boldsymbol{C},
+I_1=\operatorname{tr}\boldsymbol{C}_{\mathrm{CG}},
 \qquad
 I_2=\frac{1}{2}
 \left[
-\left(\operatorname{tr}\boldsymbol{C}\right)^2
+\left(\operatorname{tr}\boldsymbol{C}_{\mathrm{CG}}\right)^2
 -
-\operatorname{tr}\left(\boldsymbol{C}^2\right)
+\operatorname{tr}\left(\boldsymbol{C}_{\mathrm{CG}}^2\right)
 \right],
 \qquad
-I_3=\det\boldsymbol{C}=J^2,
+I_3=\det\boldsymbol{C}_{\mathrm{CG}}=J^2,
 \label{eq:ch2_invariants}
 \end{equation}
 等容修正不变量为
@@ -387,7 +388,7 @@ C_{01}\left(\bar I_2-3\right)
 \begin{equation}
 \boldsymbol{S}
 =
-2\frac{\partial W_{\mathrm{MR}}}{\partial\boldsymbol{C}},
+2\frac{\partial W_{\mathrm{MR}}}{\partial\boldsymbol{C}_{\mathrm{CG}}},
 \qquad
 \boldsymbol{\sigma}_{\mathrm e}
 =
@@ -402,7 +403,7 @@ G_0
 2\left(C_{10}+C_{01}\right),
 \label{eq:ch2_initial_shear_modulus}
 \end{equation}
-弹性模量与剪切模量之间满足
+弹性模量与初始剪切模量之间满足
 \begin{equation}
 E
 =
@@ -416,9 +417,9 @@ E
 6\left(C_{10}+C_{01}\right).
 \label{eq:ch2_mr_modulus_relation}
 \end{equation}
-该关系为材料模型的小变形理论关系。第三章样本生成程序采用 $E=6.6MR$ 的数据集特定标定关系，该关系仅用于第三章材料参数与标签之间的换算，不替代式~\eqref{eq:ch2_mr_modulus_relation}。
+式~\eqref{eq:ch2_mr_modulus_relation}为莫尼里夫林模型的小变形理论关系。第三章中材料控制参数与弹性模量标签之间的具体换算由该章给出的 $C_{10}$ 和 $C_{01}$ 设置确定。
 
-微通道模型中的固体域表示厚度为 $0.3~\mu\mathrm{m}$ 的连续等效细胞膜层，膜层内外均为流体区域。含细胞复合液滴模型中的固体域表示具有有限体积的内部细胞。两类模型均采用上述有限变形框架，但材料参数对应各自数值表示下的等效力学性质。
+微通道模型中的固体域表示具有有限厚度的连续等效细胞膜层，膜层内外均为流体区域。含细胞复合液滴模型中的固体域表示具有有限体积的内部细胞。两类模型均采用上述有限变形框架，具体几何参数和材料参数分别在第三章和第四章给出。
 
 \subsection{开尔文沃伊特黏弹性模型}
 
@@ -453,7 +454,7 @@ E
 \boldsymbol{\sigma}_{\mathrm v},
 \label{eq:ch2_kelvin_voigt_3d}
 \end{equation}
-其中，$\eta_{\mathrm s}$ 为本文数值模型中的等效黏性系数。为保持第四章原始模型的参数设置，本文将黏弹性特征时间定义为
+其中，$\eta_{\mathrm s}$ 为本文数值模型中的等效黏性系数。与第四章的参数设置一致，黏弹性特征时间定义为
 \begin{equation}
 \tau_{\mathrm v}
 =
@@ -462,16 +463,7 @@ E
 \eta_{\mathrm s}=E\tau_{\mathrm v}.
 \label{eq:ch2_kelvin_voigt_time}
 \end{equation}
-该定义属于本文模型的参数化关系。若以初始剪切模量定义剪切特征时间 $\tau_G=\eta_{\mathrm s}/G_0$，则有
-\begin{equation}
-\tau_G
-=
-2(1+\nu)\tau_{\mathrm v}
-\approx
-3\tau_{\mathrm v}.
-\label{eq:ch2_shear_characteristic_time}
-\end{equation}
-式~\eqref{eq:ch2_kelvin_voigt_time}用于第四章全部参数工况，避免弹性模量、黏性系数和特征时间之间采用不同换算关系。开尔文沃伊特模型由弹性部分和黏性部分并联组成，可描述加载过程中的迟滞和卸载后的恢复\cite{christensen1982theory,lakes1998viscoelastic}。
+该定义用于第四章全部黏弹性参数工况。开尔文沃伊特模型由弹性部分和黏性部分并联组成，可描述加载过程中的速率相关响应和卸载后的恢复\cite{christensen1982theory,lakes1998viscoelastic}。
 
 \subsection{应力与弹性应变能}
 
@@ -638,7 +630,7 @@ w_{\varphi}
 \label{eq:ch2_weak_phase_transport}
 \end{aligned}
 \end{equation}
-辅助方程的弱形式必须保留润湿边界贡献，写为
+辅助方程的弱形式保留润湿边界贡献，写为
 \begin{equation}
 \begin{aligned}
 &\int_{\Omega_{\mathrm f}}w_{\psi}\psi\,\mathrm d\Omega
@@ -654,7 +646,7 @@ w_{\psi}\varphi\left(\varphi^2-1\right)
 \\
 &\qquad
 -
-\int_{\Gamma_{\mathrm w}}
+\int_{\Gamma_{\mathrm b}}
 \frac{\varepsilon_{\mathrm{pf}}^2}{\lambda_{\mathrm{pf}}}
 w_{\psi}
 \frac{\mathrm df_{\mathrm w}}{\mathrm d\varphi}
@@ -663,7 +655,7 @@ w_{\psi}
 \label{eq:ch2_weak_phase_auxiliary}
 \end{aligned}
 \end{equation}
-式~\eqref{eq:ch2_weak_phase_auxiliary}中的最后一项由式~\eqref{eq:ch2_wetting_bc}得到。该项保证壁面自由能、平衡接触角和有限元弱形式采用同一润湿模型。
+式~\eqref{eq:ch2_weak_phase_auxiliary}中的最后一项由式~\eqref{eq:ch2_wetting_bc}得到，使壁面自由能、平衡接触角和有限元弱形式采用同一润湿模型。
 
 设固体位移试函数为 $\boldsymbol{w}_{\mathrm s}$，固体动量方程在参考构形中的弱形式为
 \begin{equation}
@@ -703,7 +695,7 @@ y^h(\boldsymbol{x},t)
 N_i(\boldsymbol{x})y_i(t),
 \label{eq:ch2_fe_interpolation}
 \end{equation}
-其中，$N_i$ 为形函数，$y_i$ 为节点自由度，$N_{\mathrm n}$ 为单元节点数。流体速度、压力、相场变量、辅助变量、固体位移和网格位移分别在相应有限元空间中展开。速度和压力插值需满足不可压缩流动的稳定性要求，相场变量和辅助变量采用连续插值。两类模型的具体单元阶次、网格尺度和局部加密范围在对应研究章节中给出，避免将不同计算域的离散参数混写为同一设置。
+其中，$N_i$ 为形函数，$y_i$ 为节点自由度，$N_{\mathrm n}$ 为单元节点数。流体速度、压力、相场变量、辅助变量、固体位移和网格位移分别在相应有限元空间中展开。速度和压力插值需满足不可压缩流动的稳定性要求，相场变量和辅助变量采用连续插值。两类模型的具体单元阶次、网格尺度、局部加密范围和求解器设置在对应研究章节中给出，避免将不同计算域的离散参数混写为同一设置。
 
 非定常计算采用后向差分公式。$k$ 阶后向差分格式为
 \begin{equation}
@@ -752,7 +744,7 @@ a_j^{(k)}y^{n+1-j},
 \Delta\boldsymbol{Y}^{(m)},
 \label{eq:ch2_newton_iteration}
 \end{equation}
-其中，$\boldsymbol{K}_{\mathrm T}^{(m)}=\partial\boldsymbol{r}/\partial\boldsymbol{Y}$ 为切线矩阵，$m$ 为非线性迭代次数。第四章在撞击初期采用较小时间步以解析快速界面运动和近壁排液，后续采用较大时间步。具体时间步和网格设置由该章的无关性分析确定。
+其中，$\boldsymbol{K}_{\mathrm T}^{(m)}=\partial\boldsymbol{r}/\partial\boldsymbol{Y}$ 为切线矩阵，$m$ 为非线性迭代次数。时间步根据界面运动、固体变形速度和收敛状态控制，具体范围及无关性分析分别在第三章和第四章给出。
 
 \subsection{模型验证与数值可靠性}
 
@@ -772,11 +764,11 @@ y_{\mathrm{ref},n}^2
 \right]^{1/2}},
 \label{eq:ch2_relative_l2}
 \end{equation}
-其中，$N_t$ 为比较时刻数。除完整时间历程外，还应比较峰值、峰值时刻和关键时刻的界面形态。模型验证、网格和时间步设置分别在第三章和第四章结合具体计算域给出。
+其中，$N_t$ 为比较时刻数。除完整时间历程外，还比较峰值、峰值时刻和关键时刻的界面形态。模型验证、网格设置和时间步设置分别在第三章和第四章结合具体计算域给出。
 
 \section{形态响应的统一表征}
 
-数值求解得到流场、固体位移和界面演化后，需要提取与成像观测相对应的形态和运动信息。两类问题均采用内部细胞轮廓和质心位置描述细胞响应。微通道问题进一步使用傅里叶系数压缩完整轮廓序列。含细胞复合液滴问题还需提取外部液滴铺展宽度、接触线位置和动态接触角。
+数值求解得到流场、固体位移和界面演化后，需要提取与成像观测相对应的形态和运动信息。两类问题均采用内部细胞轮廓和质心位置描述细胞响应。微通道问题进一步使用傅里叶系数压缩完整轮廓序列。含细胞复合液滴问题还需提取外部液滴铺展宽度、接触线位置和名义动态接触角。
 
 \subsection{轮廓点、质心与坐标处理}
 
@@ -803,24 +795,25 @@ y_{\mathrm{ref},n}^2
 \boldsymbol{x}\,\mathrm d\Omega.
 \label{eq:ch2_centroid}
 \end{equation}
-为去除平移影响，轮廓点转换为相对于质心的坐标
+为去除整体平移对形态表示的影响，轮廓点转换为相对于质心的坐标
 \begin{equation}
 \widetilde{\boldsymbol{x}}_{i,\ell}
 =
 \boldsymbol{x}_{i,\ell}
 -
-\boldsymbol{x}_{\mathrm c,\ell},
+\boldsymbol{x}_{\mathrm c,\ell}.
 \label{eq:ch2_centroid_alignment}
 \end{equation}
-采用特征长度 $L_{\mathrm{ref}}$ 归一化后，有
+
+第三章点坐标重构直接使用样本文件中保存的归一化坐标。设样本生成阶段采用的固定坐标变换为 $\mathcal{N}_{\mathrm{coord}}$，则网络使用的坐标写为
 \begin{equation}
-\boldsymbol{x}^{*}_{i,\ell}
+\boldsymbol{x}_{i,\ell}^{\mathrm n}
 =
-\frac{\widetilde{\boldsymbol{x}}_{i,\ell}}
-{L_{\mathrm{ref}}}.
-\label{eq:ch2_contour_normalization}
+\mathcal{N}_{\mathrm{coord}}
+\left(\boldsymbol{x}_{i,\ell}^{\mathrm{phys}}\right).
+\label{eq:ch2_stored_coordinate_normalization}
 \end{equation}
-闭合轮廓的采样点数、起始点和排列方向需保持一致。预测量使用帽号，归一化量使用星号，避免同一符号同时表示预测和归一化。
+训练输入、预测目标、坐标损失、坐标扰动和平均点误差均在同一数据尺度上计算。由于原始样本档案未单独保存 $\mathcal{N}_{\mathrm{coord}}$ 的物理尺度参数，点坐标误差作为无量纲数据尺度误差报告，不换算为长度单位。闭合轮廓的采样点数、起始点和排列方向在同一任务中保持一致。预测量使用帽号，质心平移后的量使用波浪号，样本文件中的归一化坐标使用上标 $\mathrm n$。
 
 \subsection{傅里叶轮廓表示}
 
@@ -872,7 +865,7 @@ a_0,a_1,b_1,\ldots,a_{N_{\mathrm F}},b_{N_{\mathrm F}}
 \mathbb{R}^{2N_{\mathrm F}+1}.
 \label{eq:ch2_fourier_vector}
 \end{equation}
-傅里叶表示能够降低点坐标维数，并通过阶数控制整体形态与局部细节之间的平衡。
+傅里叶表示能够降低点坐标维数，并通过阶数控制整体形态与局部细节之间的平衡\cite{kuhl1982elliptic}。
 
 \subsection{面积、周长、圆度与圆度偏差}
 
@@ -923,7 +916,7 @@ r^2(\vartheta)
 \end{equation}
 圆度定义为
 \begin{equation}
-C
+\mathcal{C}
 =
 \frac{2\sqrt{\pi A}}{L_{\Gamma}},
 \label{eq:ch2_circularity}
@@ -932,15 +925,15 @@ C
 \begin{equation}
 D_{\mathrm c}
 =
-1-C
+1-\mathcal{C}
 =
 1-
 \frac{2\sqrt{\pi A}}{L_{\Gamma}}.
 \label{eq:ch2_circularity_deviation}
 \end{equation}
-圆形轮廓满足 $C=1$ 和 $D_{\mathrm c}=0$。全文将 $C$ 称为圆度，将 $D_{\mathrm c}$ 称为圆度偏差，不再将二者与其他变形指数混用。若采用长短轴定义的变形指数或长宽比，应在相应研究章节单独给出公式。
+圆形轮廓满足 $\mathcal{C}=1$ 和 $D_{\mathrm c}=0$。全文将 $\mathcal{C}$ 称为圆度，将 $D_{\mathrm c}$ 称为圆度偏差。若采用长短轴定义的变形指数或长宽比，在相应研究章节中单独给出公式。
 
-\subsection{质心运动、液滴铺展与动态接触角}
+\subsection{质心运动、液滴铺展与名义动态接触角}
 
 质心速度由质心位置对时间求导得到
 \begin{equation}
@@ -975,7 +968,7 @@ U_{\mathrm{cl}}(t)
 \label{eq:ch2_contact_line_velocity}
 \end{equation}
 
-动态接触角 $\theta_{\mathrm d}$ 定义为接触线处气液界面与壁面之间位于液相内部一侧的夹角。取 $\boldsymbol{n}_{\mathrm w}$ 由固壁指向流体区域，$\boldsymbol{n}_{\mathrm{lg}}$ 由气相指向液相，则
+接触线处气液界面与壁面之间位于液相内部一侧的夹角记为 $\theta_{\mathrm d}$。取 $\boldsymbol{n}_{\mathrm w}$ 由固壁指向流体区域，$\boldsymbol{n}_{\mathrm{lg}}$ 由气相指向液相，则几何关系为
 \begin{equation}
 \theta_{\mathrm d}(t)
 =
@@ -987,13 +980,13 @@ U_{\mathrm{cl}}(t)
 \right].
 \label{eq:ch2_dynamic_contact_angle}
 \end{equation}
-后处理时将 $\varphi=0$ 等值线作为名义气液界面。接触点由该等值线与固壁的交点确定。在接触点附近选取固定物理长度 $L_{\mathrm f}$ 的界面段，以最小二乘方法拟合二次曲线，由接触点处切线计算界面法向。左右两侧采用相同的 $L_{\mathrm f}$、采样点数和拟合阶次，并分别计算接触角。需要报告单侧结果时分别给出，需要表征轴对称整体响应时取两侧平均。$L_{\mathrm f}$、采样点数、平滑方式及差分窗口在第四章的后处理设置中给出，并对全部参数工况保持不变。
+第四章采用统一的图像分割、界面提取和局部曲线拟合流程计算该角度。由于原始后处理记录未单独保存二值化阈值、拟合点数和物理拟合窗口长度，全文将该流程得到的角度称为名义动态接触角。该量用于描述相同处理条件下的阶段变化和不同工况之间的相对差异，不作为独立标定的绝对接触角。具体图像尺寸、接触点判定和曲线拟合流程见第四章。
 
 \section{形态驱动的力学参数反演}
 
 \subsection{正问题、观测过程与参数反演}
 
-图~\ref{fig:ch2_inverse_framework}给出了由数值正问题、观测算子到数据驱动参数反演的统一关系。几何参数、流动参数和边界条件作为已知工况输入，反演输出为对应任务中待识别的力学参数。
+图~\ref{fig:ch2_inverse_framework}给出了离线样本生成与在线参数反演之间的关系。几何参数、流动参数和边界条件作为已知工况输入。离线阶段在给定材料参数下求解正问题并生成带标签样本，在线阶段根据观测形态估计待识别的力学参数。
 
 \begin{figure}[htbp]
   \centering
@@ -1002,7 +995,7 @@ U_{\mathrm{cl}}(t)
   \label{fig:ch2_inverse_framework}
 \end{figure}
 
-设 $\boldsymbol{m}$ 为待求力学参数，$\boldsymbol{q}$ 为已知的流动参数、几何参数和边界条件。给定 $\boldsymbol{m}$ 和 $\boldsymbol{q}$ 后，完整状态或形态响应表示为
+设 $\boldsymbol{m}$ 为材料参数，$\boldsymbol{q}$ 为已知的流动参数、几何参数和边界条件。给定 $\boldsymbol{m}$ 和 $\boldsymbol{q}$ 后，完整状态或形态响应表示为
 \begin{equation}
 \mathcal{Y}
 =
@@ -1029,16 +1022,16 @@ U_{\mathrm{cl}}(t)
 \right),
 \label{eq:ch2_inverse_problem}
 \end{equation}
-其中，$\mathcal{I}_{\boldsymbol{\theta}}$ 为训练得到的反演映射，$\boldsymbol{\theta}$ 为网络参数，$\widehat{\boldsymbol{m}}$ 为预测结果。数据驱动模型学习的是给定数值模型、参数范围和观测方式下的反演关系，不等同于直接求解控制方程。
+其中，$\mathcal{I}_{\boldsymbol{\theta}}$ 为训练得到的反演映射，$\boldsymbol{\theta}$ 为网络参数，$\widehat{\boldsymbol{m}}$ 为预测结果。数据驱动模型学习的是给定数值模型、参数范围和观测方式下的反演关系。
 
-数值样本按完整计算过程划分为训练集、验证集和测试集。同一过程中的不同时间帧、稀疏组合和噪声版本只进入一个数据集合。连续变量采用训练集统计量进行标准化
+数值样本按完整计算过程划分为训练集、验证集和测试集。同一过程中的不同时间帧、稀疏组合和噪声版本只进入一个数据集合。需要标准化的连续变量采用训练集统计量进行处理
 \begin{equation}
 x^{*}
 =
 \frac{x-\mu_x^{\mathrm{tr}}}{s_x^{\mathrm{tr}}},
 \label{eq:ch2_standardization}
 \end{equation}
-其中，$\mu_x^{\mathrm{tr}}$ 和 $s_x^{\mathrm{tr}}$ 分别为训练集均值和标准差。验证集和测试集使用训练集确定的标准化参数，预测结果评价前还原到原始物理单位。
+其中，$\mu_x^{\mathrm{tr}}$ 和 $s_x^{\mathrm{tr}}$ 分别为训练集均值和标准差。验证集和测试集使用训练集确定的标准化参数，预测结果评价前还原到原始物理单位。式~\eqref{eq:ch2_standardization}用于一般连续特征，不替代式~\eqref{eq:ch2_stored_coordinate_normalization}所表示的第三章原始坐标变换。
 
 \subsection{基本网络运算与损失函数}
 
@@ -1186,7 +1179,15 @@ e_i
 \sum_{i=1}^{N_{\mathrm s}}e_i.
 \label{eq:ch2_mre}
 \end{equation}
-当真实值可能接近零时，不采用逐样本相对误差。对于完整序列，采用总体相对 $L_1$ 误差
+相对误差的 $95\%$ 分位值定义为
+\begin{equation}
+\mathrm{MRE@95\%}
+=
+Q_{0.95}
+\left(\{e_i\}_{i=1}^{N_{\mathrm s}}\right),
+\label{eq:ch2_mre95}
+\end{equation}
+其中，$Q_{0.95}$ 表示经验分布的 $0.95$ 分位数。当真实值可能接近零时，不采用逐样本相对误差。对于完整序列，可采用总体相对 $L_1$ 误差
 \begin{equation}
 e_{\mathrm{rel}}
 =
@@ -1197,7 +1198,7 @@ e_{\mathrm{rel}}
 \sum_{i=1}^{N_{\mathrm s}}|y_i|}.
 \label{eq:ch2_mean_relative_error}
 \end{equation}
-相对误差的95\%分位值记为 $\mathrm{MRE@95\%}$，用于评价高误差样本。Pearson相关系数为
+Pearson 相关系数为
 \begin{equation}
 r_{\mathrm P}
 =
@@ -1211,7 +1212,7 @@ r_{\mathrm P}
 \end{equation}
 其中，$\overline{\widehat y}$ 为预测值平均值。
 
-对于真实轮廓点 $\boldsymbol{x}_{i,\ell}$ 和预测轮廓点 $\widehat{\boldsymbol{x}}_{i,\ell}$，平均点误差为
+对于真实轮廓点 $\boldsymbol{x}_{i,\ell}^{\mathrm n}$ 和预测轮廓点 $\widehat{\boldsymbol{x}}_{i,\ell}^{\mathrm n}$，平均点误差为
 \begin{equation}
 e_{\mathrm{pt}}
 =
@@ -1219,9 +1220,9 @@ e_{\mathrm{pt}}
 \sum_{\ell=1}^{L}
 \sum_{i=1}^{N_{\mathrm c}}
 \left\|
-\widehat{\boldsymbol{x}}_{i,\ell}
+\widehat{\boldsymbol{x}}_{i,\ell}^{\mathrm n}
 -
-\boldsymbol{x}_{i,\ell}
+\boldsymbol{x}_{i,\ell}^{\mathrm n}
 \right\|_2,
 \label{eq:ch2_point_error}
 \end{equation}
@@ -1229,7 +1230,7 @@ e_{\mathrm{pt}}
 \begin{equation}
 e_r
 =
-\frac{1}{LN_{\vartheta}}
+\frac{100\%}{LN_{\vartheta}}
 \sum_{\ell=1}^{L}
 \sum_{j=1}^{N_{\vartheta}}
 \frac{
@@ -1237,19 +1238,30 @@ e_r
 {r_{\ell,j}},
 \label{eq:ch2_radius_relative_error}
 \end{equation}
-其中，$N_{\vartheta}$ 为角度采样点数。几何量 $h\in\{A,L_{\Gamma},C,D_{\mathrm c}\}$ 的平均绝对误差为
+其中，$N_{\vartheta}$ 为角度采样点数。几何量 $h\in\{A,L_{\Gamma},\mathcal{C},D_{\mathrm c}\}$ 的平均绝对误差为
 \begin{equation}
-e_h
+e_h^{\mathrm{abs}}
 =
 \frac{1}{L}
 \sum_{\ell=1}^{L}
-\left|\widehat h_{\ell}-h_{\ell}\right|.
-\label{eq:ch2_geometry_error}
+\left|\widehat h_{\ell}-h_{\ell}\right|,
+\label{eq:ch2_geometry_absolute_error}
 \end{equation}
-面积和周长还可采用相对误差评价。轮廓重构结果应同时报告点坐标误差、整体几何量误差和由重构序列得到的下游参数预测误差。
+面积和周长的平均相对误差为
+\begin{equation}
+e_h^{\mathrm{rel}}
+=
+\frac{100\%}{L}
+\sum_{\ell=1}^{L}
+\frac{|\widehat h_{\ell}-h_{\ell}|}{|h_{\ell}|},
+\qquad
+h\in\{A,L_{\Gamma}\}.
+\label{eq:ch2_geometry_relative_error}
+\end{equation}
+轮廓重构结果同时报告点坐标误差、整体几何量误差和由重构序列得到的下游参数预测误差。
 
 \section{本章小结}
 
 本章从两类形态响应问题的共同力学基础出发，建立了流体运动、气液界面、细胞有限变形和流固耦合的数学描述。微通道模型与含细胞复合液滴模型共享不可压缩流体方程、细胞材料关系、界面运动连续、牵引平衡和任意拉格朗日欧拉有限元框架。二者的差异主要体现在外部气液界面、壁面润湿、细胞几何表示和载荷形式。相场与润湿模型仅用于含细胞复合液滴下降接触过程，微通道模型重点描述压差驱动下有限厚度细胞膜层与胞内外流体的耦合运动。
 
-在统一数值框架基础上，本章进一步定义了轮廓点、质心、傅里叶系数、面积、周长、圆度、圆度偏差、质心速度、铺展因子和动态接触角，并建立了正问题、观测算子和数据驱动反演之间的数学关系。第三章至第五章将在本章所给方程、符号和评价指标基础上，分别说明具体计算条件、数据构造、网络结构和参数预测结果。
+在统一数值框架基础上，本章进一步定义了轮廓点、质心、傅里叶系数、面积、周长、圆度、圆度偏差、质心速度、铺展因子和名义动态接触角，并建立了正问题、观测算子和数据驱动反演之间的数学关系。第三章至第五章将在本章所给方程、符号和评价指标基础上，分别说明具体计算条件、数据构造、网络结构和参数预测结果。
