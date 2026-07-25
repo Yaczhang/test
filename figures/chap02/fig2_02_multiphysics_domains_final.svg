@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620">
+<defs><marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#333"/></marker></defs>
+<style>text{font-family:'Noto Sans CJK SC','Microsoft YaHei',sans-serif;fill:#222}.t{font-size:30px;font-weight:600}.s{font-size:23px}.line{stroke:#333;stroke-width:4;fill:none}.gas{fill:#e3eeea}.liquid{fill:#bfe0cd;stroke:#333;stroke-width:4}.cell{fill:#7fb996;stroke:#333;stroke-width:4}</style>
+<rect x="25" y="25" width="1150" height="550" rx="12" fill="#e3eeea" stroke="#333" stroke-width="4"/>
+<text class="t" x="600" y="70" text-anchor="middle">含细胞复合液滴下降接触的多物理场计算域</text>
+<text class="s" x="160" y="140">气相区域</text><line class="line" x1="600" y1="90" x2="600" y2="520"/><text class="s" x="615" y="120">对称轴</text>
+<line class="line" x1="70" y1="520" x2="1130" y2="520"/><text class="s" x="600" y="555" text-anchor="middle">固壁：无滑移与润湿边界</text>
+<ellipse class="liquid" cx="600" cy="320" rx="250" ry="175"/><ellipse class="cell" cx="600" cy="330" rx="72" ry="58"/>
+<text class="s" x="600" y="335" text-anchor="middle">内部细胞</text><text class="s" x="600" y="205" text-anchor="middle">液滴液相</text>
+<line class="line" x1="600" y1="95" x2="600" y2="165" marker-end="url(#a)"/><text class="s" x="650" y="130">初始下降速度</text>
+<line class="line" x1="880" y1="315" x2="790" y2="315" marker-end="url(#a)"/><text class="s" x="890" y="305">φ=0气液界面</text>
+<line class="line" x1="820" y1="390" x2="672" y2="360" marker-end="url(#a)"/><text class="s" x="825" y="405">流固界面</text>
+<line class="line" x1="600" y1="455" x2="770" y2="455" marker-end="url(#a)"/><line class="line" x1="600" y1="455" x2="430" y2="455" marker-end="url(#a)"/><text class="s" x="600" y="490" text-anchor="middle">接触后的径向流动</text>
+</svg>
