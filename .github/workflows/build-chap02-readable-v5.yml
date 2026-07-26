@@ -9,6 +9,14 @@ on:
       - .github/workflows/build-chap02-readable-v5.yml
       - chatgpt-transfer/chap02_final_common_notation_v4.tex
       - chatgpt-transfer/refs_ch2_final_locked.bib
+  pull_request:
+    branches:
+      - main
+    paths:
+      - scripts/revise_chap02_readable.py
+      - .github/workflows/build-chap02-readable-v5.yml
+      - chatgpt-transfer/chap02_final_common_notation_v4.tex
+      - chatgpt-transfer/refs_ch2_final_locked.bib
   workflow_dispatch:
 
 permissions:
@@ -20,6 +28,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -91,7 +101,5 @@ EOF
             echo "No generated changes to commit"
           else
             git commit -m "Generate readable Chapter 2 final V5"
-            git push
+            git push origin HEAD:${{ github.head_ref || github.ref_name }}
           fi
-
-# Trigger generation after workflow installation.
