@@ -1,0 +1,95 @@
+name: Build Chapter 2 Readable V5
+
+on:
+  push:
+    branches:
+      - chatgpt-transfer-ch2-final-readable-output3
+    paths:
+      - scripts/revise_chap02_readable.py
+      - .github/workflows/build-chap02-readable-v5.yml
+      - chatgpt-transfer/chap02_final_common_notation_v4.tex
+      - chatgpt-transfer/refs_ch2_final_locked.bib
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Generate revised chapter and static report
+        run: python scripts/revise_chap02_readable.py
+
+      - name: Compile LaTeX
+        uses: xu-cheng/latex-action@v3
+        with:
+          root_file: check_chap02_readable_v5.tex
+          working_directory: chatgpt-transfer
+          latexmk_use_xelatex: true
+          args: -interaction=nonstopmode -halt-on-error -file-line-error
+
+      - name: Check compilation log
+        shell: bash
+        run: |
+          set -e
+          LOG=chatgpt-transfer/check_chap02_readable_v5.log
+          test -f "$LOG"
+          if grep -E "Overfull|Underfull|undefined references|undefined citations|Citation .* undefined|Reference .* undefined|LaTeX Error" "$LOG"; then
+            echo "LaTeX quality check failed"
+            exit 1
+          fi
+
+      - name: Finalize report and package
+        shell: bash
+        run: |
+          set -e
+          cp chatgpt-transfer/check_chap02_readable_v5.pdf chatgpt-transfer/chap02_final_readable_v5_preview.pdf
+          cat >> chatgpt-transfer/第二章终稿可读公式版V5_验收报告.md <<'EOF'
+
+## 独立编译检查
+
+- XeLaTeX 编译：通过
+- BibTeX 解析：通过
+- Overfull：未检出
+- Underfull：未检出
+- 未定义交叉引用：未检出
+- 未定义文献：未检出
+- LaTeX Error：未检出
+
+## 最终判断
+
+在当前第二章的既定研究范围内，章节结构、文本风格、公式可读性、参数定义、标点、引用关系和独立编译均通过检查。张量双点积、张量迹、二范数和形式变分导数已改为分量形式。该版本可作为第二章终稿完成版候选，并在同步回完整论文工程后进行一次全工程集成编译。
+EOF
+          cd chatgpt-transfer
+          zip -j 第二章终稿可读公式版V5_修改文件包.zip \
+            chap02_final_readable_v5.tex \
+            chap02_final_readable_v5_preview.pdf \
+            denotation_ch2_common_notation_v4.tex \
+            refs_ch2_final_locked.bib \
+            第二章终稿可读公式版V5_验收报告.md
+
+      - name: Commit generated files
+        shell: bash
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add chatgpt-transfer/chap02_final_readable_v5.tex \
+                  chatgpt-transfer/chap02_final_readable_v5_preview.pdf \
+                  chatgpt-transfer/第二章终稿可读公式版V5_验收报告.md \
+                  chatgpt-transfer/第二章终稿可读公式版V5_修改文件包.zip
+          if git diff --cached --quiet; then
+            echo "No generated changes to commit"
+          else
+            git commit -m "Generate readable Chapter 2 final V5"
+            git push
+          fi
