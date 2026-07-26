@@ -93,3 +93,5 @@ EOF
             git commit -m "Generate readable Chapter 2 final V5"
             git push
           fi
+
+# Trigger generation after workflow installation.
